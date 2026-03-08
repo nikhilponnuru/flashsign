@@ -3,6 +3,7 @@ package flashsign
 import (
 	"bytes"
 	"compress/flate"
+	"compress/zlib"
 	"fmt"
 	"io"
 	"strconv"
@@ -449,8 +450,16 @@ func readStreamData(data []byte, dictContent []byte, dictEnd int) ([]byte, error
 }
 
 // inflateBytes decompresses FlateDecode data.
+// PDF FlateDecode uses zlib (RFC 1950) wrapping deflate. We try zlib first,
+// falling back to raw deflate for non-standard producers.
 func inflateBytes(compressed []byte) ([]byte, error) {
-	r := flate.NewReader(bytes.NewReader(compressed))
+	r, err := zlib.NewReader(bytes.NewReader(compressed))
+	if err != nil {
+		// Fallback to raw deflate for non-standard streams.
+		fr := flate.NewReader(bytes.NewReader(compressed))
+		defer fr.Close()
+		return io.ReadAll(fr)
+	}
 	defer r.Close()
 	return io.ReadAll(r)
 }

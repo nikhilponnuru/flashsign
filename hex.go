@@ -7,8 +7,9 @@ import (
 
 const (
 	// contentsPlaceholderLen is the number of hex characters reserved for the
-	// PKCS#7 DER-encoded signature. 3072 hex chars = 1536 bytes.
-	contentsPlaceholderLen = 3072
+	// PKCS#7 DER-encoded signature. 16384 hex chars = 8192 bytes.
+	// Large enough for RSA-4096 signatures with multi-cert chains (e.g. Zerodha production PFX).
+	contentsPlaceholderLen = 16384
 
 	// byteRangePlaceholder is written into the signature dictionary initially with
 	// zero offsets. It gets patched in-place after the increment is built.
