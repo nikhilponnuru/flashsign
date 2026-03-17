@@ -105,6 +105,28 @@ func TestExtractIndirectRef(t *testing.T) {
 	}
 }
 
+func TestParsePDFXrefStream(t *testing.T) {
+	data, err := os.ReadFile(filepath.Join("testdata", "mcx-SUN844.pdf"))
+	if err != nil {
+		t.Fatalf("read xref stream PDF: %v", err)
+	}
+
+	pi, err := parsePDF(data, 1)
+	if err != nil {
+		t.Fatalf("parsePDF (xref stream): %v", err)
+	}
+
+	if pi.catalogObjNr == 0 {
+		t.Fatal("catalog object number is 0")
+	}
+	if pi.pageObjNr == 0 {
+		t.Fatal("page object number is 0")
+	}
+	if pi.nextObjNr == 0 {
+		t.Fatal("next object number is 0")
+	}
+}
+
 func TestParseSignedPDF(t *testing.T) {
 	// Test parsing a previously signed PDF (which has incremental updates).
 	signer, err := NewSignerFromPFX(filepath.Join("testdata", "test.pfx"), "test123")

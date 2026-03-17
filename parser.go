@@ -6,7 +6,6 @@ import (
 	"compress/zlib"
 	"fmt"
 	"io"
-	"strconv"
 )
 
 // pdfInfo holds the minimal PDF metadata needed for signing.
@@ -156,9 +155,9 @@ func findStartxref(data []byte) (int64, error) {
 	if j == i {
 		return 0, fmt.Errorf("no offset after startxref")
 	}
-	offset, err := strconv.ParseInt(string(rest[i:j]), 10, 64)
-	if err != nil {
-		return 0, err
+	var offset int64
+	for k := i; k < j; k++ {
+		offset = offset*10 + int64(rest[k]-'0')
 	}
 	return offset, nil
 }
@@ -276,8 +275,8 @@ func parseTraditionalXref(data []byte, offset int64) (map[int]xrefEntry, trailer
 			if len(line) < 18 {
 				continue
 			}
-			entryOffset, _ := strconv.ParseInt(string(bytes.TrimSpace(line[:10])), 10, 64)
-			gen, _ := strconv.Atoi(string(bytes.TrimSpace(line[11:16])))
+			entryOffset := parseInt64Bytes(line, 0, 10)
+			gen := parseIntBytes(line, 11, 16)
 			inUse := false
 			for _, b := range line[16:] {
 				if b == 'n' {
@@ -478,7 +477,8 @@ func extractTrailerFields(dict []byte) trailerInfo {
 	var t trailerInfo
 
 	if v := extractDictValue(dict, "Size"); v != nil {
-		t.size, _ = strconv.Atoi(string(bytes.TrimSpace(v)))
+		p := skipWhitespaceInSlice(v, 0)
+		t.size, _ = parseInt(v, p)
 	}
 	if v := extractDictValue(dict, "Root"); v != nil {
 		t.rootObjNr, t.rootGen, _ = extractIndirectRef(v)
@@ -487,7 +487,8 @@ func extractTrailerFields(dict []byte) trailerInfo {
 		t.infoObjNr, t.infoGen, _ = extractIndirectRef(v)
 	}
 	if v := extractDictValue(dict, "Prev"); v != nil {
-		t.prevXref, _ = strconv.ParseInt(string(bytes.TrimSpace(v)), 10, 64)
+		p := skipWhitespaceInSlice(v, 0)
+		t.prevXref, _ = parseInt64(v, p)
 	}
 	if v := extractDictValue(dict, "ID"); v != nil {
 		// Store the raw /ID value including the array brackets.
@@ -599,8 +600,8 @@ func readCompressedObject(data []byte, xref map[int]xrefEntry, objStreamNr int, 
 	if nVal == nil || firstVal == nil {
 		return nil, fmt.Errorf("object stream missing /N or /First")
 	}
-	n, _ := strconv.Atoi(string(bytes.TrimSpace(nVal)))
-	first, _ := strconv.Atoi(string(bytes.TrimSpace(firstVal)))
+	n, _ := parseInt(nVal, skipWhitespaceInSlice(nVal, 0))
+	first, _ := parseInt(firstVal, skipWhitespaceInSlice(firstVal, 0))
 
 	// Read and decompress stream data.
 	streamData, err := readStreamData(data, dictContent, dictEnd)
@@ -837,31 +838,80 @@ func findValueEnd(dict []byte, pos int) int {
 }
 
 // extractIndirectRef parses "N G R" from value bytes.
+// Zero-allocation: parses backwards from the trailing 'R'.
 func extractIndirectRef(val []byte) (int, int, error) {
-	val = bytes.TrimSpace(val)
-	parts := bytes.Fields(val)
-	if len(parts) < 3 || string(parts[len(parts)-1]) != "R" {
+	// Trim trailing whitespace.
+	end := len(val)
+	for end > 0 && isSpace(val[end-1]) {
+		end--
+	}
+	if end == 0 || val[end-1] != 'R' {
 		return 0, 0, fmt.Errorf("not an indirect ref: %q", val)
 	}
-	objNr, err := strconv.Atoi(string(parts[len(parts)-3]))
-	if err != nil {
-		return 0, 0, err
+	end-- // skip 'R'
+
+	// Skip whitespace before 'R'.
+	for end > 0 && isSpace(val[end-1]) {
+		end--
 	}
-	gen, err := strconv.Atoi(string(parts[len(parts)-2]))
-	if err != nil {
-		return 0, 0, err
+
+	// Parse gen number (backwards).
+	genEnd := end
+	for end > 0 && val[end-1] >= '0' && val[end-1] <= '9' {
+		end--
 	}
+	if end == genEnd {
+		return 0, 0, fmt.Errorf("not an indirect ref: %q", val)
+	}
+	gen := 0
+	mul := 1
+	for i := genEnd - 1; i >= end; i-- {
+		gen += int(val[i]-'0') * mul
+		mul *= 10
+	}
+
+	// Skip whitespace before gen.
+	for end > 0 && isSpace(val[end-1]) {
+		end--
+	}
+
+	// Parse obj number (backwards).
+	objEnd := end
+	for end > 0 && val[end-1] >= '0' && val[end-1] <= '9' {
+		end--
+	}
+	if end == objEnd {
+		return 0, 0, fmt.Errorf("not an indirect ref: %q", val)
+	}
+	objNr := 0
+	mul = 1
+	for i := objEnd - 1; i >= end; i-- {
+		objNr += int(val[i]-'0') * mul
+		mul *= 10
+	}
+
 	return objNr, gen, nil
 }
 
 // isIndirectRef checks if value bytes look like "N G R".
+// Zero-allocation: checks trailing 'R' then verifies digits before it.
 func isIndirectRef(val []byte) bool {
-	val = bytes.TrimSpace(val)
-	parts := bytes.Fields(val)
-	if len(parts) < 3 {
+	end := len(val)
+	for end > 0 && isSpace(val[end-1]) {
+		end--
+	}
+	if end == 0 || val[end-1] != 'R' {
 		return false
 	}
-	return string(parts[len(parts)-1]) == "R"
+	end--
+	// Need at least whitespace + digit + whitespace + digit before 'R'.
+	for end > 0 && isSpace(val[end-1]) {
+		end--
+	}
+	if end == 0 || val[end-1] < '0' || val[end-1] > '9' {
+		return false
+	}
+	return true
 }
 
 // extractArrayContent returns the content bytes inside [ ].
@@ -976,7 +1026,7 @@ func walkPageTree(data []byte, xref map[int]xrefEntry, objNr int, targetPage int
 		if kidTypeName == "Page" {
 			count = 1
 		} else if cVal := extractDictValue(kidDict, "Count"); cVal != nil {
-			count, _ = strconv.Atoi(string(bytes.TrimSpace(cVal)))
+			count, _ = parseInt(cVal, skipWhitespaceInSlice(cVal, 0))
 		}
 
 		if currentPage+count >= targetPage {
@@ -989,16 +1039,45 @@ func walkPageTree(data []byte, xref map[int]xrefEntry, objNr int, targetPage int
 }
 
 // parseIndirectRefs extracts all "N G R" patterns from array content bytes.
+// Zero-allocation: walks bytes directly instead of using bytes.Fields.
 func parseIndirectRefs(content []byte) []int {
 	var refs []int
-	fields := bytes.Fields(content)
-	for i := 0; i+2 < len(fields); i++ {
-		if string(fields[i+2]) == "R" {
-			objNr, err := strconv.Atoi(string(fields[i]))
-			if err == nil {
-				refs = append(refs, objNr)
-				i += 2
+	pos := 0
+	for {
+		pos = skipWhitespaceInSlice(content, pos)
+		if pos >= len(content) {
+			break
+		}
+		// Parse first number (obj number).
+		objNr, n := parseInt(content, pos)
+		if n == 0 {
+			// Skip non-digit token.
+			for pos < len(content) && !isSpace(content[pos]) {
+				pos++
 			}
+			continue
+		}
+		pos += n
+
+		pos = skipWhitespaceInSlice(content, pos)
+		if pos >= len(content) {
+			break
+		}
+		// Parse second number (gen number).
+		_, n = parseInt(content, pos)
+		if n == 0 {
+			continue
+		}
+		pos += n
+
+		pos = skipWhitespaceInSlice(content, pos)
+		if pos >= len(content) {
+			break
+		}
+		// Check for 'R'.
+		if content[pos] == 'R' && (pos+1 >= len(content) || isSpace(content[pos+1]) || content[pos+1] == ']') {
+			refs = append(refs, objNr)
+			pos++
 		}
 	}
 	return refs
@@ -1057,16 +1136,22 @@ func skipPastKeyword(data []byte, pos int, keyword string) int {
 
 func parseInt(data []byte, pos int) (int, int) {
 	start := pos
+	neg := false
 	if pos < len(data) && data[pos] == '-' {
+		neg = true
 		pos++
 	}
+	val := 0
 	for pos < len(data) && data[pos] >= '0' && data[pos] <= '9' {
+		val = val*10 + int(data[pos]-'0')
 		pos++
 	}
-	if pos == start {
+	if pos == start || (neg && pos == start+1) {
 		return 0, 0
 	}
-	val, _ := strconv.Atoi(string(data[start:pos]))
+	if neg {
+		val = -val
+	}
 	return val, pos - start
 }
 
@@ -1076,12 +1161,19 @@ func parseIntInSlice(data []byte, pos int) (int, int) {
 
 func parseIntArray(content []byte) []int {
 	var result []int
-	fields := bytes.Fields(content)
-	for _, f := range fields {
-		v, err := strconv.Atoi(string(f))
-		if err == nil {
-			result = append(result, v)
+	pos := 0
+	for {
+		pos = skipWhitespaceInSlice(content, pos)
+		if pos >= len(content) {
+			break
 		}
+		v, n := parseInt(content, pos)
+		if n == 0 {
+			pos++
+			continue
+		}
+		result = append(result, v)
+		pos += n
 	}
 	return result
 }
@@ -1133,4 +1225,52 @@ func safeSlice(data []byte, start, end int) []byte {
 		return nil
 	}
 	return data[start:end]
+}
+
+// parseInt64 parses an int64 from data starting at pos (like parseInt but int64).
+func parseInt64(data []byte, pos int) (int64, int) {
+	start := pos
+	var val int64
+	for pos < len(data) && data[pos] >= '0' && data[pos] <= '9' {
+		val = val*10 + int64(data[pos]-'0')
+		pos++
+	}
+	if pos == start {
+		return 0, 0
+	}
+	return val, pos - start
+}
+
+// parseInt64Bytes parses an int64 from a fixed byte range, skipping leading spaces.
+func parseInt64Bytes(data []byte, start, end int) int64 {
+	for start < end && (data[start] == ' ' || data[start] == '0') {
+		start++
+	}
+	if start == end {
+		return 0
+	}
+	var val int64
+	for i := start; i < end; i++ {
+		if data[i] >= '0' && data[i] <= '9' {
+			val = val*10 + int64(data[i]-'0')
+		}
+	}
+	return val
+}
+
+// parseIntBytes parses an int from a fixed byte range, skipping leading spaces.
+func parseIntBytes(data []byte, start, end int) int {
+	for start < end && (data[start] == ' ' || data[start] == '0') {
+		start++
+	}
+	if start == end {
+		return 0
+	}
+	val := 0
+	for i := start; i < end; i++ {
+		if data[i] >= '0' && data[i] <= '9' {
+			val = val*10 + int(data[i]-'0')
+		}
+	}
+	return val
 }

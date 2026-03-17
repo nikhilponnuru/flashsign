@@ -9,7 +9,6 @@ import (
 	"encoding/asn1"
 	"errors"
 	"math/big"
-	"sort"
 	"time"
 )
 
@@ -195,17 +194,13 @@ func (s *Signer) buildCMSSignature(contentHash []byte, signingTime time.Time) ([
 	stAttrContent = appendDERSet(stAttrContent, timeDER)
 	stAttr := appendDERSequence(nil, stAttrContent)
 
-	// Sort attributes by DER encoding (DER SET OF requirement).
-	attrs := [][]byte{s.contentTypeAttr, mdAttr, stAttr}
-	sort.Slice(attrs, func(i, j int) bool {
-		return compareDER(attrs[i], attrs[j]) < 0
-	})
-
-	// Concatenate sorted attributes for SET content.
-	var attrSetContent []byte
-	for _, a := range attrs {
-		attrSetContent = append(attrSetContent, a...)
-	}
+	// Concatenate attributes in DER-sorted order.
+	// The OIDs sort as: contentType (.9.3) < messageDigest (.9.4) < signingTime (.9.5),
+	// so the order is always: contentTypeAttr, mdAttr, stAttr.
+	attrSetContent := make([]byte, 0, len(s.contentTypeAttr)+len(mdAttr)+len(stAttr))
+	attrSetContent = append(attrSetContent, s.contentTypeAttr...)
+	attrSetContent = append(attrSetContent, mdAttr...)
+	attrSetContent = append(attrSetContent, stAttr...)
 
 	// Build the SET wrapper for hashing (uses SET tag 0x31).
 	attrSetDER := appendDERSet(nil, attrSetContent)
