@@ -1,6 +1,7 @@
 package flashsign
 
 import (
+	"bytes"
 	"crypto/ecdsa"
 	"crypto/elliptic"
 	"crypto/rand"
@@ -108,4 +109,34 @@ func mustBigInt(s string) *big.Int {
 	n := new(big.Int)
 	n.SetString(s, 10)
 	return n
+}
+
+func TestDigestAlgorithmMatchesP384(t *testing.T) {
+	ecKey, err := ecdsa.GenerateKey(elliptic.P384(), rand.Reader)
+	if err != nil {
+		t.Fatalf("generate ECDSA P-384 key: %v", err)
+	}
+
+	template := &x509.Certificate{SerialNumber: mustBigInt("123457")}
+	template.Subject.CommonName = "ECDSA P384 Test"
+	certDER, err := x509.CreateCertificate(rand.Reader, template, template, &ecKey.PublicKey, ecKey)
+	if err != nil {
+		t.Fatalf("create certificate: %v", err)
+	}
+	cert, err := x509.ParseCertificate(certDER)
+	if err != nil {
+		t.Fatalf("parse certificate: %v", err)
+	}
+
+	signer, err := NewSigner(Config{
+		Key:   ecKey,
+		Chain: []*x509.Certificate{cert},
+	})
+	if err != nil {
+		t.Fatalf("create signer: %v", err)
+	}
+
+	if !bytes.Contains(signer.digestAlgDER, derOIDSHA384) {
+		t.Fatal("P-384 signer digest algorithm is not SHA-384")
+	}
 }

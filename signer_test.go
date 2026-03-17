@@ -176,6 +176,38 @@ func TestSignStreamToDiscard(t *testing.T) {
 	}
 }
 
+func TestSignInPlace(t *testing.T) {
+	signer, err := NewSignerFromPFX(filepath.Join("testdata", "test.pfx"), "test123")
+	if err != nil {
+		t.Fatalf("create signer: %v", err)
+	}
+
+	inData, err := os.ReadFile(filepath.Join("testdata", "test.pdf"))
+	if err != nil {
+		t.Fatalf("read input file: %v", err)
+	}
+
+	inPath := filepath.Join(t.TempDir(), "in-place.pdf")
+	if err := os.WriteFile(inPath, inData, 0o644); err != nil {
+		t.Fatalf("write temp input: %v", err)
+	}
+
+	if err := signer.Sign(SignParams{Src: inPath}); err != nil {
+		t.Fatalf("Sign in-place returned error: %v", err)
+	}
+
+	outData, err := os.ReadFile(inPath)
+	if err != nil {
+		t.Fatalf("read in-place output: %v", err)
+	}
+	if len(outData) <= len(inData) {
+		t.Fatalf("expected in-place output larger than input: out=%d in=%d", len(outData), len(inData))
+	}
+	if !bytes.Contains(outData, []byte("ByteRange")) {
+		t.Fatal("in-place output missing ByteRange")
+	}
+}
+
 func TestSignAndEncrypt(t *testing.T) {
 	signer, err := NewSignerFromPFX(filepath.Join("testdata", "test.pfx"), "test123")
 	if err != nil {
@@ -215,6 +247,38 @@ func TestSignAndEncrypt(t *testing.T) {
 				t.Fatalf("encrypted output file (%s) is empty", tt.name)
 			}
 		})
+	}
+}
+
+func TestSignAndEncryptInPlace(t *testing.T) {
+	signer, err := NewSignerFromPFX(filepath.Join("testdata", "test.pfx"), "test123")
+	if err != nil {
+		t.Fatalf("create signer: %v", err)
+	}
+
+	inData, err := os.ReadFile(filepath.Join("testdata", "test.pdf"))
+	if err != nil {
+		t.Fatalf("read input file: %v", err)
+	}
+
+	inPath := filepath.Join(t.TempDir(), "in-place-encrypt.pdf")
+	if err := os.WriteFile(inPath, inData, 0o644); err != nil {
+		t.Fatalf("write temp input: %v", err)
+	}
+
+	if err := signer.SignAndEncrypt(
+		SignParams{Src: inPath},
+		EncryptParams{Password: "secret"},
+	); err != nil {
+		t.Fatalf("SignAndEncrypt in-place returned error: %v", err)
+	}
+
+	outData, err := os.ReadFile(inPath)
+	if err != nil {
+		t.Fatalf("read in-place encrypted output: %v", err)
+	}
+	if len(outData) == 0 {
+		t.Fatal("in-place encrypted output is empty")
 	}
 }
 

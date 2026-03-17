@@ -6,6 +6,7 @@ import (
 	"crypto/rand"
 	"crypto/rsa"
 	"crypto/sha256"
+	"crypto/sha512"
 	"encoding/asn1"
 	"errors"
 	"math/big"
@@ -17,6 +18,7 @@ var (
 	oidData          = asn1.ObjectIdentifier{1, 2, 840, 113549, 1, 7, 1}
 	oidSignedData    = asn1.ObjectIdentifier{1, 2, 840, 113549, 1, 7, 2}
 	oidSHA256        = asn1.ObjectIdentifier{2, 16, 840, 1, 101, 3, 4, 2, 1}
+	oidSHA384        = asn1.ObjectIdentifier{2, 16, 840, 1, 101, 3, 4, 2, 2}
 	oidRSAEncryption = asn1.ObjectIdentifier{1, 2, 840, 113549, 1, 1, 1}
 	oidECDSASHA256   = asn1.ObjectIdentifier{1, 2, 840, 10045, 4, 3, 2}
 	oidECDSASHA384   = asn1.ObjectIdentifier{1, 2, 840, 10045, 4, 3, 3}
@@ -32,6 +34,7 @@ var (
 	derOIDData        []byte // OID encoding of id-data
 	derOIDSignedData  []byte // OID encoding of id-signedData
 	derOIDSHA256      []byte // OID encoding of SHA-256
+	derOIDSHA384      []byte // OID encoding of SHA-384
 	derOIDRSA         []byte // OID encoding of RSA
 	derOIDECDSASHA256 []byte // OID encoding of ecdsa-with-SHA256
 	derOIDECDSASHA384 []byte // OID encoding of ecdsa-with-SHA384
@@ -53,6 +56,7 @@ func init() {
 	derOIDData, _ = asn1.Marshal(oidData)
 	derOIDSignedData, _ = asn1.Marshal(oidSignedData)
 	derOIDSHA256, _ = asn1.Marshal(oidSHA256)
+	derOIDSHA384, _ = asn1.Marshal(oidSHA384)
 	derOIDRSA, _ = asn1.Marshal(oidRSAEncryption)
 	derOIDECDSASHA256, _ = asn1.Marshal(oidECDSASHA256)
 	derOIDECDSASHA384, _ = asn1.Marshal(oidECDSASHA384)
@@ -131,9 +135,13 @@ func (s *Signer) precomputeCMS() error {
 	issContent = append(issContent, serialDER...)
 	s.issuerSerialDER = appendDERSequence(nil, issContent)
 
-	// digestAlgorithm: SEQUENCE { SHA-256 OID, NULL }
-	algContent := make([]byte, 0, len(derOIDSHA256)+len(derNullParams))
-	algContent = append(algContent, derOIDSHA256...)
+	// digestAlgorithm: SEQUENCE { digest OID, NULL }
+	digestOID := derOIDSHA256
+	if s.keyType == keyTypeECDSAP384 {
+		digestOID = derOIDSHA384
+	}
+	algContent := make([]byte, 0, len(digestOID)+len(derNullParams))
+	algContent = append(algContent, digestOID...)
 	algContent = append(algContent, derNullParams...)
 	s.digestAlgDER = appendDERSequence(nil, algContent)
 
@@ -205,11 +213,18 @@ func (s *Signer) buildCMSSignature(contentHash []byte, signingTime time.Time) ([
 	// Build the SET wrapper for hashing (uses SET tag 0x31).
 	attrSetDER := appendDERSet(nil, attrSetContent)
 
-	// Hash the attribute SET for signing.
-	attrHash := sha256.Sum256(attrSetDER)
+	// Hash the attribute SET for signing with the same digest as SignerInfo.digestAlgorithm.
+	var attrHash []byte
+	if s.keyType == keyTypeECDSAP384 {
+		sum := sha512.Sum384(attrSetDER)
+		attrHash = sum[:]
+	} else {
+		sum := sha256.Sum256(attrSetDER)
+		attrHash = sum[:]
+	}
 
 	// Sign the hash.
-	sig, err := s.signHash(attrHash[:])
+	sig, err := s.signHash(attrHash)
 	if err != nil {
 		return nil, err
 	}

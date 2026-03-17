@@ -3,20 +3,45 @@ package flashsign
 import (
 	"bytes"
 	"crypto/sha256"
+	"crypto/sha512"
 	"fmt"
 	"hash"
 	"io"
 	"os"
+	"path/filepath"
 	"runtime"
 	"sync"
 	"time"
 )
 
-// hashPool provides reusable SHA-256 hash instances.
-var hashPool = sync.Pool{
+// hashPoolSHA256 provides reusable SHA-256 hash instances.
+var hashPoolSHA256 = sync.Pool{
 	New: func() any {
 		return sha256.New()
 	},
+}
+
+// hashPoolSHA384 provides reusable SHA-384 hash instances.
+var hashPoolSHA384 = sync.Pool{
+	New: func() any {
+		return sha512.New384()
+	},
+}
+
+func (s *Signer) acquireDigest() hash.Hash {
+	if s.keyType == keyTypeECDSAP384 {
+		return hashPoolSHA384.Get().(hash.Hash)
+	}
+	return hashPoolSHA256.Get().(hash.Hash)
+}
+
+func (s *Signer) releaseDigest(h hash.Hash) {
+	h.Reset()
+	if s.keyType == keyTypeECDSAP384 {
+		hashPoolSHA384.Put(h)
+		return
+	}
+	hashPoolSHA256.Put(h)
 }
 
 // SignBytes signs PDF bytes in memory and returns the signed PDF bytes.
@@ -55,12 +80,12 @@ func (s *Signer) SignBytes(pdfData []byte, params SignParams) ([]byte, error) {
 	formatByteRange(result, byteRangePos, contentValueStart, contentValueEnd, totalLen-contentValueEnd)
 
 	// Hash signed ranges.
-	h := hashPool.Get().(hash.Hash)
+	h := s.acquireDigest()
 	h.Reset()
 	h.Write(result[:contentValueStart])
 	h.Write(result[contentValueEnd:])
 	contentHash := h.Sum(nil)
-	hashPool.Put(h)
+	s.releaseDigest(h)
 
 	// Build CMS signature.
 	cmsSig, err := s.buildCMSSignature(contentHash, signingTime)
@@ -115,22 +140,22 @@ func (s *Signer) SignStream(src io.ReadSeeker, dst io.Writer, params SignParams)
 	contentsIncrStart := offsets.contentsHexInIncr - 1
 	contentsIncrEnd := offsets.contentsHexEndIncr + 1
 
-	h := hashPool.Get().(hash.Hash)
+	h := s.acquireDigest()
 	h.Reset()
 
 	if _, err := src.Seek(0, io.SeekStart); err != nil {
-		hashPool.Put(h)
+		s.releaseDigest(h)
 		return fmt.Errorf("seek start for hash: %w", err)
 	}
 	if _, err := io.Copy(h, src); err != nil {
-		hashPool.Put(h)
+		s.releaseDigest(h)
 		return fmt.Errorf("hash src: %w", err)
 	}
 	h.Write(incrBytes[:contentsIncrStart])
 	h.Write(incrBytes[contentsIncrEnd:])
 
 	contentHash := h.Sum(nil)
-	hashPool.Put(h)
+	s.releaseDigest(h)
 
 	// Build CMS signature.
 	cmsSig, err := s.buildCMSSignature(contentHash, signingTime)
@@ -164,16 +189,20 @@ func (s *Signer) SignStream(src io.ReadSeeker, dst io.Writer, params SignParams)
 
 // Sign signs a PDF file and writes the result to the destination path.
 func (s *Signer) Sign(params SignParams) error {
+	destPath := params.Dest
+	if destPath == "" {
+		destPath = params.Src
+	}
+
+	if sameFilePath(params.Src, destPath) {
+		return s.signInPlace(params, destPath)
+	}
+
 	srcFile, err := os.Open(params.Src)
 	if err != nil {
 		return fmt.Errorf("open input PDF: %w", err)
 	}
 	defer srcFile.Close()
-
-	destPath := params.Dest
-	if destPath == "" {
-		destPath = params.Src
-	}
 
 	dstFile, err := os.Create(destPath)
 	if err != nil {
@@ -184,6 +213,51 @@ func (s *Signer) Sign(params SignParams) error {
 	if err := s.SignStream(srcFile, dstFile, params); err != nil {
 		return fmt.Errorf("sign PDF: %w", err)
 	}
+	return nil
+}
+
+func (s *Signer) signInPlace(params SignParams, destPath string) error {
+	srcFile, err := os.Open(params.Src)
+	if err != nil {
+		return fmt.Errorf("open input PDF: %w", err)
+	}
+	defer srcFile.Close()
+
+	srcStat, err := srcFile.Stat()
+	if err != nil {
+		return fmt.Errorf("stat input PDF: %w", err)
+	}
+
+	tmpFile, err := os.CreateTemp(filepath.Dir(destPath), ".flashsign-*.pdf")
+	if err != nil {
+		return fmt.Errorf("create temp output PDF: %w", err)
+	}
+	tmpPath := tmpFile.Name()
+	cleanup := true
+	defer func() {
+		if cleanup {
+			_ = tmpFile.Close()
+			_ = os.Remove(tmpPath)
+		}
+	}()
+
+	if err := s.SignStream(srcFile, tmpFile, params); err != nil {
+		return fmt.Errorf("sign PDF: %w", err)
+	}
+	if err := tmpFile.Sync(); err != nil {
+		return fmt.Errorf("sync temp output PDF: %w", err)
+	}
+	if err := tmpFile.Close(); err != nil {
+		return fmt.Errorf("close temp output PDF: %w", err)
+	}
+	if err := os.Chmod(tmpPath, srcStat.Mode()); err != nil {
+		return fmt.Errorf("chmod temp output PDF: %w", err)
+	}
+	if err := os.Rename(tmpPath, destPath); err != nil {
+		return fmt.Errorf("replace destination PDF: %w", err)
+	}
+
+	cleanup = false
 	return nil
 }
 
@@ -213,15 +287,44 @@ func (s *Signer) SignAndEncrypt(params SignParams, enc EncryptParams) error {
 		return fmt.Errorf("sign PDF: %w", err)
 	}
 
-	dstFile, err := os.Create(destPath)
+	inPlace := sameFilePath(params.Src, destPath)
+	outPath := destPath
+	if inPlace {
+		tmpFile, err := os.CreateTemp(filepath.Dir(destPath), ".flashsign-enc-*.pdf")
+		if err != nil {
+			return fmt.Errorf("create temp output PDF: %w", err)
+		}
+		outPath = tmpFile.Name()
+		if err := tmpFile.Close(); err != nil {
+			return fmt.Errorf("close temp output PDF: %w", err)
+		}
+		defer os.Remove(outPath)
+	}
+
+	dstFile, err := os.Create(outPath)
 	if err != nil {
 		return fmt.Errorf("create output PDF: %w", err)
 	}
-	defer dstFile.Close()
 
 	signedReader := bytes.NewReader(signedData)
 	if err := encryptPDFStream(signedReader, dstFile, enc.Password, keyLength); err != nil {
+		_ = dstFile.Close()
 		return fmt.Errorf("encrypt PDF: %w", err)
+	}
+	if err := dstFile.Close(); err != nil {
+		return fmt.Errorf("close output PDF: %w", err)
+	}
+
+	if inPlace {
+		srcInfo, err := os.Stat(params.Src)
+		if err == nil {
+			if chmodErr := os.Chmod(outPath, srcInfo.Mode()); chmodErr != nil {
+				return fmt.Errorf("chmod temp encrypted PDF: %w", chmodErr)
+			}
+		}
+		if err := os.Rename(outPath, destPath); err != nil {
+			return fmt.Errorf("replace destination PDF: %w", err)
+		}
 	}
 
 	return nil
@@ -255,4 +358,16 @@ func (s *Signer) SignBatch(items []BatchItem) {
 	}
 
 	wg.Wait()
+}
+
+func sameFilePath(a, b string) bool {
+	if a == "" || b == "" {
+		return false
+	}
+	absA, errA := filepath.Abs(a)
+	absB, errB := filepath.Abs(b)
+	if errA == nil && errB == nil {
+		return absA == absB
+	}
+	return filepath.Clean(a) == filepath.Clean(b)
 }

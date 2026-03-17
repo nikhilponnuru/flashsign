@@ -1,6 +1,6 @@
 # flashsign
 
-High-performance PDF digital signing library and CLI in Go. Drop-in replacement for jpdfsigner (Java/OpenPDF/BouncyCastle) for signing Zerodha contract note PDFs.
+High-performance PDF digital signing library and CLI in Go.
 
 ## Features
 
@@ -8,6 +8,7 @@ High-performance PDF digital signing library and CLI in Go. Drop-in replacement 
 - Visible and invisible signatures
 - Sign + AES-128/256 encryption
 - PFX (PKCS#12) and PEM certificate loading
+- `config.ini` support for easy deployment
 - Custom PDF parser — no pdfcpu in the signing hot path
 - Pre-computed CMS/DER fragments for zero-alloc signing
 - Concurrent batch signing
@@ -21,20 +22,47 @@ go build -o flashsign ./cmd/flashsign/
 
 ## Usage
 
-### Sign a PDF
+### Using config.ini
 
-```bash
-./flashsign sign \
-  -pfx Zerodha.pfx \
-  -pfx-pass 'yourpassword' \
-  -src input.pdf \
-  -dest output.pdf \
-  -reason "Regulatory" \
-  -contact "Zerodha Broking Limited" \
-  -location "Zerodha Broking Limited, Bangalore"
+Create a `config.ini` with your signing settings:
+
+```ini
+# Certificate
+keyfile=Zerodha.pfx
+password=yourpassword
+
+# Signature metadata
+reason=Regulatory
+contact=Zerodha Broking Limited
+location=Zerodha Broking Limited, Bangalore
+
+# Visible signature coordinates (PDF coordinate system: 0,0 at bottom-left)
+page=1
+x1=0
+y1=609
+x2=278
+y2=550
 ```
 
-### Sign with visible signature
+Then sign with:
+
+```bash
+./flashsign sign -config config.ini -src input.pdf -dest output.pdf
+```
+
+Sign and encrypt:
+
+```bash
+./flashsign encrypt -config config.ini -src input.pdf -dest output.pdf -password "clientPAN123"
+```
+
+Flags override config values, so you can use the config for defaults and override per-invocation:
+
+```bash
+./flashsign sign -config config.ini -src input.pdf -dest output.pdf -reason "Override reason"
+```
+
+### Using flags only
 
 ```bash
 ./flashsign sign \
@@ -50,9 +78,7 @@ go build -o flashsign ./cmd/flashsign/
   -location "Zerodha Broking Limited, Bangalore"
 ```
 
-Coordinates use the PDF coordinate system: (0,0) is at the bottom-left of the page. `x1,y1` is the bottom-left corner and `x2,y2` is the top-right corner of the signature box.
-
-### Sign and encrypt
+### Sign and encrypt (flags)
 
 ```bash
 ./flashsign encrypt \
@@ -69,25 +95,51 @@ Coordinates use the PDF coordinate system: (0,0) is at the bottom-left of the pa
   -password "clientPAN123"
 ```
 
-Encryption uses AES-128 by default (same as jpdfsigner). Add `-aes256` for AES-256.
+Encryption uses AES-128 by default. Add `-aes256` for AES-256.
 
-### Using PEM certificates instead of PFX
+### Using PEM certificates
 
 ```bash
-./flashsign sign \
-  -cert cert.pem \
-  -key key.pem \
-  -src input.pdf \
-  -dest output.pdf
+./flashsign sign -cert cert.pem -key key.pem -src input.pdf -dest output.pdf
 ```
 
-## CLI Reference
+Or in config.ini:
+
+```ini
+cert=cert.pem
+key=key.pem
+```
+
+## config.ini reference
+
+| Key | Description |
+|-----|-------------|
+| `keyfile` | Path to PKCS#12 (.pfx/.p12) certificate file |
+| `password` | PKCS#12 password |
+| `cert` | PEM certificate path (alternative to keyfile) |
+| `key` | PEM private key path (alternative to keyfile) |
+| `reason` | Signature reason |
+| `contact` | Signer contact info |
+| `location` | Signing location |
+| `page` | Page number for visible signature (default: 1) |
+| `visible` | Enable visible signature (`true`/`false`) |
+| `x1` | Signature box left X coordinate |
+| `y1` | Signature box bottom Y coordinate |
+| `x2` | Signature box right X coordinate |
+| `y2` | Signature box top Y coordinate |
+
+Setting any coordinate (`x1`/`x2`) automatically enables visible signature.
+
+Coordinates use the PDF coordinate system: `(0,0)` is at the bottom-left of the page. `x1,y1` is the bottom-left corner and `x2,y2` is the top-right corner of the signature box.
+
+## CLI reference
 
 ```
 flashsign sign    [flags]   Sign a PDF
 flashsign encrypt [flags]   Sign and encrypt a PDF
 
 Common flags:
+  -config string     Path to config.ini (optional, flags override config values)
   -pfx string        PKCS#12 (.pfx/.p12) certificate path
   -pfx-pass string   PKCS#12 password
   -cert string       PEM certificate path (alternative to -pfx)
@@ -111,9 +163,9 @@ Encrypt flags:
   -aes256            Use AES-256 instead of AES-128
 ```
 
-## Library Usage
+## Library usage
 
-flashsign is also a Go library. Import it directly:
+flashsign is also a Go library:
 
 ```go
 import "flashsign"
@@ -182,7 +234,6 @@ err := signer.SignAndEncrypt(
 items := []flashsign.BatchItem{
     {PDFData: pdf1, Params: flashsign.SignParams{Reason: "Regulatory"}},
     {PDFData: pdf2, Params: flashsign.SignParams{Reason: "Regulatory"}},
-    // ...
 }
 signer.SignBatch(items)
 for _, item := range items {
@@ -194,14 +245,98 @@ for _, item := range items {
 }
 ```
 
-## Run Tests
+## Test and benchmark guide
+
+### 1) Quick correctness checks
+
+Run unit tests:
 
 ```bash
 go test ./...
 ```
 
-## Run Benchmarks
+Run race detector:
 
 ```bash
-go test -bench=. -benchmem -count=3
+go test -race ./...
+```
+
+### 2) CLI smoke test (contract-note style PDF)
+
+This example assumes `./testdata/Zerodha.pfx` and `./testdata/mcx-SUN844.pdf` are available.
+
+Build binary:
+
+```bash
+go build -o flashsign ./cmd/flashsign/
+```
+
+Sign a sample PDF using config defaults (override only what changes per run):
+
+```bash
+./flashsign sign \
+  -config ./config.ini \
+  -pfx ./testdata/Zerodha.pfx \
+  -src ./testdata/mcx-SUN844.pdf \
+  -dest /tmp/mcx-SUN844.signed.pdf
+```
+
+Sanity-check signature markers:
+
+```bash
+rg -a -n "ByteRange|adbe\\.pkcs7\\.detached|/Reason|/Location" /tmp/mcx-SUN844.signed.pdf
+```
+
+Verify output size increased:
+
+```bash
+wc -c ./testdata/mcx-SUN844.pdf /tmp/mcx-SUN844.signed.pdf
+```
+
+Optional in-place write check (`-src == -dest`):
+
+```bash
+cp ./testdata/mcx-SUN844.pdf /tmp/mcx-SUN844.inplace.pdf
+./flashsign sign \
+  -config ./config.ini \
+  -pfx ./testdata/Zerodha.pfx \
+  -src /tmp/mcx-SUN844.inplace.pdf \
+  -dest /tmp/mcx-SUN844.inplace.pdf
+```
+
+### 3) Benchmarking
+
+Run full benchmark suite:
+
+```bash
+go test -run '^$' -bench . -benchmem -count=3
+```
+
+Run focused hot-path benchmarks:
+
+```bash
+go test -run '^$' \
+  -bench 'Benchmark(SignBytes$|SignBytesVisible$|SignStreamVisible$|PKCS7Signature$|SignAndEncrypt$)' \
+  -benchmem -count=3
+```
+
+Run parallel throughput benchmark:
+
+```bash
+go test -run '^$' -bench 'BenchmarkSignBytesVisibleParallel$' -benchmem -count=3
+```
+
+### 4) Saving and comparing benchmark runs
+
+Save current run:
+
+```bash
+go test -run '^$' -bench . -benchmem -count=5 > /tmp/flashsign.bench.txt
+```
+
+Optional: compare two runs with `benchstat`:
+
+```bash
+go install golang.org/x/perf/cmd/benchstat@latest
+benchstat /tmp/old.bench.txt /tmp/flashsign.bench.txt
 ```
