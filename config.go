@@ -94,4 +94,8 @@ type Signer struct {
 	certTagDER      []byte // [0] IMPLICIT { cert chain DER }
 	contentTypeAttr []byte // pre-encoded contentType attribute DER
 	oidSignedData   []byte // OID encoding of id-signedData
+
+	// Per-signer reserved hex placeholder for /Contents.
+	contentsPlaceholderLen int
+	contentsZeros          []byte
 }

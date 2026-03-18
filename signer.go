@@ -12,6 +12,9 @@ import (
 	"runtime"
 	"sync"
 	"time"
+
+	"github.com/pdfcpu/pdfcpu/pkg/api"
+	"github.com/pdfcpu/pdfcpu/pkg/pdfcpu/model"
 )
 
 // hashPoolSHA256 provides reusable SHA-256 hash instances.
@@ -56,9 +59,14 @@ func (s *Signer) SignBytes(pdfData []byte, params SignParams) ([]byte, error) {
 		return nil, err
 	}
 
+	// Get pooled buffer for increment.
+	bp := slicePool.Get().(*[]byte)
+
 	// Build incremental update.
-	incr, offsets, err := s.buildIncrement(pi, srcSize, reason, contact, location, rect, visible, signingTime)
+	incr, offsets, err := s.buildIncrement(*bp, &pi, srcSize, reason, contact, location, rect, visible, signingTime)
 	if err != nil {
+		*bp = incr
+		slicePool.Put(bp)
 		return nil, err
 	}
 
@@ -68,7 +76,8 @@ func (s *Signer) SignBytes(pdfData []byte, params SignParams) ([]byte, error) {
 	copy(result[len(pdfData):], incr)
 
 	// Return increment buffer to pool.
-	slicePool.Put(incr[:0])
+	*bp = incr
+	slicePool.Put(bp)
 
 	// Compute absolute positions.
 	contentValueStart := srcSize + int64(offsets.contentsHexInIncr) - 1
@@ -84,7 +93,8 @@ func (s *Signer) SignBytes(pdfData []byte, params SignParams) ([]byte, error) {
 	h.Reset()
 	h.Write(result[:contentValueStart])
 	h.Write(result[contentValueEnd:])
-	contentHash := h.Sum(nil)
+	var contentHashBuf [48]byte // 48 = max for SHA-384
+	contentHash := h.Sum(contentHashBuf[:0])
 	s.releaseDigest(h)
 
 	// Build CMS signature.
@@ -95,8 +105,8 @@ func (s *Signer) SignBytes(pdfData []byte, params SignParams) ([]byte, error) {
 
 	// Hex-encode and patch Contents.
 	sigHexLen := len(cmsSig) * 2
-	if sigHexLen > contentsPlaceholderLen {
-		return nil, fmt.Errorf("CMS signature too large: %d hex chars (max %d)", sigHexLen, contentsPlaceholderLen)
+	if sigHexLen > s.contentsPlaceholderLen {
+		return nil, fmt.Errorf("CMS signature too large: %d hex chars (max %d)", sigHexLen, s.contentsPlaceholderLen)
 	}
 	contentsHexStart := int(srcSize) + offsets.contentsHexInIncr
 	encodeUpperHex(result[contentsHexStart:contentsHexStart+sigHexLen], cmsSig)
@@ -120,9 +130,14 @@ func (s *Signer) SignStream(src io.ReadSeeker, dst io.Writer, params SignParams)
 		return err
 	}
 
+	// Get pooled buffer for increment.
+	bp := slicePool.Get().(*[]byte)
+
 	// Build incremental update.
-	incr, offsets, err := s.buildIncrement(pi, srcSize, reason, contact, location, rect, visible, signingTime)
+	incr, offsets, err := s.buildIncrement(*bp, &pi, srcSize, reason, contact, location, rect, visible, signingTime)
 	if err != nil {
+		*bp = incr
+		slicePool.Put(bp)
 		return err
 	}
 
@@ -145,60 +160,83 @@ func (s *Signer) SignStream(src io.ReadSeeker, dst io.Writer, params SignParams)
 
 	if _, err := src.Seek(0, io.SeekStart); err != nil {
 		s.releaseDigest(h)
+		*bp = incr
+		slicePool.Put(bp)
 		return fmt.Errorf("seek start for hash: %w", err)
 	}
 	if _, err := io.Copy(h, src); err != nil {
 		s.releaseDigest(h)
+		*bp = incr
+		slicePool.Put(bp)
 		return fmt.Errorf("hash src: %w", err)
 	}
 	h.Write(incrBytes[:contentsIncrStart])
 	h.Write(incrBytes[contentsIncrEnd:])
 
-	contentHash := h.Sum(nil)
+	var contentHashBuf [48]byte
+	contentHash := h.Sum(contentHashBuf[:0])
 	s.releaseDigest(h)
 
 	// Build CMS signature.
 	cmsSig, err := s.buildCMSSignature(contentHash, signingTime)
 	if err != nil {
+		*bp = incr
+		slicePool.Put(bp)
 		return fmt.Errorf("build CMS signature: %w", err)
 	}
 
 	// Hex-encode into increment buffer.
 	sigHexLen := len(cmsSig) * 2
-	if sigHexLen > contentsPlaceholderLen {
-		return fmt.Errorf("CMS signature too large: %d hex chars (max %d)", sigHexLen, contentsPlaceholderLen)
+	if sigHexLen > s.contentsPlaceholderLen {
+		*bp = incr
+		slicePool.Put(bp)
+		return fmt.Errorf("CMS signature too large: %d hex chars (max %d)", sigHexLen, s.contentsPlaceholderLen)
 	}
 	encodeUpperHex(incrBytes[offsets.contentsHexInIncr:offsets.contentsHexInIncr+sigHexLen], cmsSig)
 
 	// Write output.
 	if _, err := src.Seek(0, io.SeekStart); err != nil {
+		*bp = incr
+		slicePool.Put(bp)
 		return fmt.Errorf("seek start for write: %w", err)
 	}
 	if _, err := io.Copy(dst, src); err != nil {
+		*bp = incr
+		slicePool.Put(bp)
 		return fmt.Errorf("write src to dst: %w", err)
 	}
 	if _, err := dst.Write(incrBytes); err != nil {
+		*bp = incr
+		slicePool.Put(bp)
 		return fmt.Errorf("write increment to dst: %w", err)
 	}
 
 	// Return buffer to pool.
-	slicePool.Put(incr[:0])
+	*bp = incr
+	slicePool.Put(bp)
 
 	return nil
 }
 
 // Sign signs a PDF file and writes the result to the destination path.
 func (s *Signer) Sign(params SignParams) error {
+	srcPath := params.Src
 	destPath := params.Dest
 	if destPath == "" {
-		destPath = params.Src
+		destPath = srcPath
 	}
 
-	if sameFilePath(params.Src, destPath) {
-		return s.signInPlace(params, destPath)
+	preparedSrcPath, cleanupPreparedSrc, err := prepareCompatSource(srcPath)
+	if err != nil {
+		return fmt.Errorf("prepare source PDF: %w", err)
+	}
+	defer cleanupPreparedSrc()
+
+	if sameFilePath(srcPath, destPath) {
+		return s.signInPlace(params, preparedSrcPath, destPath)
 	}
 
-	srcFile, err := os.Open(params.Src)
+	srcFile, err := os.Open(preparedSrcPath)
 	if err != nil {
 		return fmt.Errorf("open input PDF: %w", err)
 	}
@@ -216,8 +254,8 @@ func (s *Signer) Sign(params SignParams) error {
 	return nil
 }
 
-func (s *Signer) signInPlace(params SignParams, destPath string) error {
-	srcFile, err := os.Open(params.Src)
+func (s *Signer) signInPlace(params SignParams, srcPath, destPath string) error {
+	srcFile, err := os.Open(srcPath)
 	if err != nil {
 		return fmt.Errorf("open input PDF: %w", err)
 	}
@@ -259,6 +297,76 @@ func (s *Signer) signInPlace(params SignParams, destPath string) error {
 
 	cleanup = false
 	return nil
+}
+
+func prepareCompatSource(srcPath string) (preparedPath string, cleanup func(), err error) {
+	hasXRefStream, err := sourceUsesXRefStream(srcPath)
+	if err != nil {
+		return "", nil, err
+	}
+	if !hasXRefStream {
+		return srcPath, func() {}, nil
+	}
+
+	tmpFile, err := os.CreateTemp(filepath.Dir(srcPath), ".flashsign-srcnorm-*.pdf")
+	if err != nil {
+		return "", nil, err
+	}
+	tmpPath := tmpFile.Name()
+	if err := tmpFile.Close(); err != nil {
+		_ = os.Remove(tmpPath)
+		return "", nil, err
+	}
+
+	// Rewrite to classic xref sections for better compatibility with strict viewers.
+	conf := model.NewDefaultConfiguration()
+	conf.ValidationMode = model.ValidationRelaxed
+	conf.WriteObjectStream = false
+	conf.WriteXRefStream = false
+	conf.Optimize = false
+	conf.OptimizeBeforeWriting = false
+	conf.OptimizeResourceDicts = false
+	conf.ValidateLinks = false
+
+	if err := api.OptimizeFile(srcPath, tmpPath, conf); err != nil {
+		_ = os.Remove(tmpPath)
+		return "", nil, err
+	}
+
+	return tmpPath, func() { _ = os.Remove(tmpPath) }, nil
+}
+
+func sourceUsesXRefStream(path string) (bool, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return false, err
+	}
+	defer f.Close()
+
+	st, err := f.Stat()
+	if err != nil {
+		return false, err
+	}
+
+	const maxTail = 1 << 20 // 1MB
+	readSize := st.Size()
+	if readSize > maxTail {
+		readSize = maxTail
+	}
+	start := st.Size() - readSize
+	if _, err := f.Seek(start, io.SeekStart); err != nil {
+		return false, err
+	}
+
+	buf := make([]byte, readSize)
+	n, err := io.ReadFull(f, buf)
+	if err != nil && err != io.EOF && err != io.ErrUnexpectedEOF {
+		return false, err
+	}
+	buf = buf[:n]
+
+	return bytes.Contains(buf, []byte("/Type/XRef")) ||
+		bytes.Contains(buf, []byte("/Type /XRef")), nil
 }
 
 // SignAndEncrypt signs a PDF file and then encrypts it with AES.

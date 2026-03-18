@@ -1,2 +1,12 @@
-testdata/
+# Build artifacts
+flashsign
+*.bin
+
+# Config with credentials
 config.ini
+
+# Test data and generated outputs
+testdata/
+
+# OS junk
+.DS_Store

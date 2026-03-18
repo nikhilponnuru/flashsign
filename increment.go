@@ -2,8 +2,6 @@ package flashsign
 
 import (
 	"bytes"
-	"sort"
-	"strconv"
 	"sync"
 	"time"
 )
@@ -16,14 +14,21 @@ type incrOffsets struct {
 }
 
 // slicePool provides reusable byte slices for building increments.
+// Stores *[]byte to avoid interface boxing allocation on Put.
 var slicePool = sync.Pool{
 	New: func() any {
 		b := make([]byte, 0, 32*1024)
-		return b
+		return &b
 	},
 }
 
-func (s *Signer) buildIncrement(pi *pdfInfo, srcSize int64, reason, contact, location string, rect Rectangle, visible bool, signingTime time.Time) ([]byte, *incrOffsets, error) {
+// Package-level key byte slices for appendDictWithoutKey (avoids string concat + []byte alloc).
+var (
+	kwSlashAcroForm = []byte("/AcroForm")
+	kwSlashAnnots   = []byte("/Annots")
+)
+
+func (s *Signer) buildIncrement(buf []byte, pi *pdfInfo, srcSize int64, reason, contact, location string, rect Rectangle, visible bool, signingTime time.Time) ([]byte, incrOffsets, error) {
 	// Allocate object numbers.
 	sigValueObjNr := pi.nextObjNr
 	widgetObjNr := pi.nextObjNr + 1
@@ -37,7 +42,6 @@ func (s *Signer) buildIncrement(pi *pdfInfo, srcSize int64, reason, contact, loc
 		nextObj++
 	}
 
-	buf := slicePool.Get().([]byte)
 	buf = buf[:0]
 	buf = append(buf, '\n')
 
@@ -55,7 +59,7 @@ func (s *Signer) buildIncrement(pi *pdfInfo, srcSize int64, reason, contact, loc
 		xrefCount++
 	}
 
-	offsets := &incrOffsets{}
+	var offsets incrOffsets
 
 	// === Signature Value Dictionary ===
 	recordOffset(sigValueObjNr)
@@ -66,31 +70,31 @@ func (s *Signer) buildIncrement(pi *pdfInfo, srcSize int64, reason, contact, loc
 	buf = append(buf, '\n')
 	buf = append(buf, "/Contents <"...)
 	offsets.contentsHexInIncr = len(buf)
-	buf = append(buf, contentsZeros...)
+	buf = append(buf, s.contentsZeros...)
 	offsets.contentsHexEndIncr = len(buf)
 	buf = append(buf, ">\n"...)
 	if s.signerNameStr != "" {
 		buf = append(buf, "/Name ("...)
-		buf = append(buf, pdfEscapeString(s.signerNameStr)...)
+		buf = appendPDFEscaped(buf, s.signerNameStr)
 		buf = append(buf, ")\n"...)
 	}
 	if reason != "" {
 		buf = append(buf, "/Reason ("...)
-		buf = append(buf, pdfEscapeString(reason)...)
+		buf = appendPDFEscaped(buf, reason)
 		buf = append(buf, ")\n"...)
 	}
 	if contact != "" {
 		buf = append(buf, "/ContactInfo ("...)
-		buf = append(buf, pdfEscapeString(contact)...)
+		buf = appendPDFEscaped(buf, contact)
 		buf = append(buf, ")\n"...)
 	}
 	if location != "" {
 		buf = append(buf, "/Location ("...)
-		buf = append(buf, pdfEscapeString(location)...)
+		buf = appendPDFEscaped(buf, location)
 		buf = append(buf, ")\n"...)
 	}
 	buf = append(buf, "/M ("...)
-	buf = append(buf, signingTime.Format("D:20060102150405+00'00'")...)
+	buf = appendPDFDate(buf, signingTime)
 	buf = append(buf, ")\n>>\nendobj\n\n"...)
 
 	// === Widget Annotation ===
@@ -123,7 +127,6 @@ func (s *Signer) buildIncrement(pi *pdfInfo, srcSize int64, reason, contact, loc
 
 	// === Appearance Stream (if visible) ===
 	if visible && appearanceObjNr > 0 {
-		streamContent := buildAppearanceStream(rect, s.signerNameStr, reason, location, signingTime)
 		width := rect.X2 - rect.X1
 		height := rect.Y2 - rect.Y1
 
@@ -132,7 +135,7 @@ func (s *Signer) buildIncrement(pi *pdfInfo, srcSize int64, reason, contact, loc
 		buf = appendInt(buf, fontObjNr)
 		buf = append(buf, " 0 obj\n<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /Encoding /WinAnsiEncoding >>\nendobj\n\n"...)
 
-		// Form XObject.
+		// Form XObject with placeholder /Length (patched after stream content).
 		recordOffset(appearanceObjNr)
 		buf = appendInt(buf, appearanceObjNr)
 		buf = append(buf, " 0 obj\n<<\n/Type /XObject\n/Subtype /Form\n/FormType 1\n/BBox [0 0 "...)
@@ -142,10 +145,15 @@ func (s *Signer) buildIncrement(pi *pdfInfo, srcSize int64, reason, contact, loc
 		buf = append(buf, "]\n/Resources << /Font << /F1 "...)
 		buf = appendInt(buf, fontObjNr)
 		buf = append(buf, " 0 R >> >>\n/Length "...)
-		buf = strconv.AppendInt(buf, int64(len(streamContent)), 10)
+		lengthPos := len(buf)
+		buf = append(buf, "      "...) // 6-char placeholder
 		buf = append(buf, "\n>>\nstream\n"...)
-		buf = append(buf, streamContent...)
+		streamStart := len(buf)
+		buf = appendAppearanceStream(buf, rect, s.signerNameStr, reason, location, signingTime)
+		streamLen := len(buf) - streamStart
 		buf = append(buf, "\nendstream\nendobj\n\n"...)
+		// Patch /Length value in-place.
+		patchDecimal(buf, lengthPos, 6, streamLen)
 	}
 
 	// === Modified Catalog ===
@@ -153,7 +161,7 @@ func (s *Signer) buildIncrement(pi *pdfInfo, srcSize int64, reason, contact, loc
 	buf = appendInt(buf, pi.catalogObjNr)
 	buf = append(buf, " 0 obj\n<<"...)
 	// Copy raw catalog dict, removing /AcroForm.
-	buf = appendDictWithoutKey(buf, pi.catalogRaw, "AcroForm")
+	buf = appendDictWithoutKey(buf, pi.catalogRaw, kwSlashAcroForm)
 	buf = append(buf, "\n/AcroForm << /Fields ["...)
 	if pi.existingFields != nil && len(pi.existingFields) > 0 {
 		buf = append(buf, ' ')
@@ -169,7 +177,7 @@ func (s *Signer) buildIncrement(pi *pdfInfo, srcSize int64, reason, contact, loc
 	buf = appendInt(buf, pi.pageObjNr)
 	buf = append(buf, " 0 obj\n<<"...)
 	// Copy raw page dict, removing /Annots.
-	buf = appendDictWithoutKey(buf, pi.pageRaw, "Annots")
+	buf = appendDictWithoutKey(buf, pi.pageRaw, kwSlashAnnots)
 	buf = append(buf, "\n/Annots ["...)
 	if pi.existingAnnots != nil && len(pi.existingAnnots) > 0 {
 		buf = append(buf, ' ')
@@ -229,11 +237,9 @@ func (s *Signer) buildIncrement(pi *pdfInfo, srcSize int64, reason, contact, loc
 }
 
 // appendDictWithoutKey copies raw dict content to buf, removing the specified key entry.
-func appendDictWithoutKey(buf []byte, raw []byte, key string) []byte {
-	searchKey := "/" + key
-	keyBytes := []byte(searchKey)
-
-	pos := findTopLevelKey(raw, keyBytes)
+// key must be a package-level []byte like kwSlashAcroForm (avoids string alloc).
+func appendDictWithoutKey(buf []byte, raw []byte, key []byte) []byte {
+	pos := findTopLevelKey(raw, key)
 	if pos < 0 {
 		// Key not found, copy everything.
 		return append(buf, raw...)
@@ -246,7 +252,7 @@ func appendDictWithoutKey(buf []byte, raw []byte, key string) []byte {
 	}
 
 	// Skip past the key.
-	keyEnd := pos + len(keyBytes)
+	keyEnd := pos + len(key)
 	// Skip whitespace after key.
 	for keyEnd < len(raw) && raw[keyEnd] == ' ' {
 		keyEnd++
@@ -337,6 +343,7 @@ func (s *Signer) resolveParams(params SignParams) (reason, contact, location str
 	if params.Rect != nil {
 		rect = *params.Rect
 	}
+	rect = normalizeRectangle(rect)
 	visible = s.cfg.Visible
 	if params.Visible != nil {
 		visible = *params.Visible
@@ -344,22 +351,12 @@ func (s *Signer) resolveParams(params SignParams) (reason, contact, location str
 	return
 }
 
-// sortInts sorts a small int slice using insertion sort (faster than sort.Ints for N<10).
-func sortInts(a []int) {
-	if len(a) <= 1 {
-		return
+func normalizeRectangle(rect Rectangle) Rectangle {
+	if rect.X1 > rect.X2 {
+		rect.X1, rect.X2 = rect.X2, rect.X1
 	}
-	if len(a) > 8 {
-		sort.Ints(a)
-		return
+	if rect.Y1 > rect.Y2 {
+		rect.Y1, rect.Y2 = rect.Y2, rect.Y1
 	}
-	for i := 1; i < len(a); i++ {
-		key := a[i]
-		j := i - 1
-		for j >= 0 && a[j] > key {
-			a[j+1] = a[j]
-			j--
-		}
-		a[j+1] = key
-	}
+	return rect
 }

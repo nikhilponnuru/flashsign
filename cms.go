@@ -9,7 +9,7 @@ import (
 	"crypto/sha512"
 	"encoding/asn1"
 	"errors"
-	"math/big"
+	"sync"
 	"time"
 )
 
@@ -64,6 +64,12 @@ func init() {
 	derOIDMsgDigest, _ = asn1.Marshal(oidMessageDigest)
 	derOIDSigningTime, _ = asn1.Marshal(oidSigningTime)
 }
+
+// cmsPool provides reusable scratch buffers for buildCMSSignature.
+var cmsPool = sync.Pool{New: func() any {
+	b := make([]byte, 0, 8192)
+	return &b
+}}
 
 // DER encoding helpers that work with append semantics.
 
@@ -121,6 +127,30 @@ func derLength(length int) int {
 	return 4
 }
 
+// derTLVLen returns the total DER-encoded size of a tag-length-value element.
+func derTLVLen(contentLen int) int {
+	return 1 + derLength(contentLen) + contentLen
+}
+
+// appendUTCTime appends a DER-encoded UTCTime (tag 0x17) for the given time.
+// Format: YYMMDDHHMMSSZ (13 content bytes, 15 total). Zero allocations.
+func appendUTCTime(buf []byte, t time.Time) []byte {
+	t = t.UTC()
+	y, mo, d := t.Date()
+	hh, mm, ss := t.Clock()
+	yy := y % 100
+	return append(buf,
+		0x17, 0x0D, // tag + length(13)
+		byte('0'+yy/10), byte('0'+yy%10),
+		byte('0'+int(mo)/10), byte('0'+int(mo)%10),
+		byte('0'+d/10), byte('0'+d%10),
+		byte('0'+hh/10), byte('0'+hh%10),
+		byte('0'+mm/10), byte('0'+mm%10),
+		byte('0'+ss/10), byte('0'+ss%10),
+		'Z',
+	)
+}
+
 // precomputeCMS builds all constant CMS DER fragments at Signer creation time.
 func (s *Signer) precomputeCMS() error {
 	cert := s.cfg.Chain[0]
@@ -153,7 +183,6 @@ func (s *Signer) precomputeCMS() error {
 		encContent = append(encContent, derNullParams...)
 		s.digestEncAlgDER = appendDERSequence(nil, encContent)
 	case keyTypeECDSAP256:
-		// ECDSA algorithms have no parameters (absent, not NULL)
 		s.digestEncAlgDER = appendDERSequence(nil, derOIDECDSASHA256)
 	case keyTypeECDSAP384:
 		s.digestEncAlgDER = appendDERSequence(nil, derOIDECDSASHA384)
@@ -182,38 +211,64 @@ func (s *Signer) precomputeCMS() error {
 }
 
 // buildCMSSignature creates a DER-encoded CMS SignedData structure.
+// Uses a pooled scratch buffer for near-zero allocations.
+// Only allocations: signHash return (crypto library) + final result copy.
 func (s *Signer) buildCMSSignature(contentHash []byte, signingTime time.Time) ([]byte, error) {
-	// Build messageDigest attribute:
-	// SEQUENCE { OID(messageDigest), SET { OCTET STRING(hash) } }
-	mdValue := appendDEROctetString(nil, contentHash)
-	mdAttrContent := make([]byte, 0, len(derOIDMsgDigest)+2+len(mdValue))
-	mdAttrContent = append(mdAttrContent, derOIDMsgDigest...)
-	mdAttrContent = appendDERSet(mdAttrContent, mdValue)
-	mdAttr := appendDERSequence(nil, mdAttrContent)
+	hashLen := len(contentHash)
 
-	// Build signingTime attribute:
-	// SEQUENCE { OID(signingTime), SET { UTCTime(time) } }
-	timeDER, err := asn1.Marshal(signingTime.UTC())
-	if err != nil {
-		return nil, err
-	}
-	stAttrContent := make([]byte, 0, len(derOIDSigningTime)+2+len(timeDER))
-	stAttrContent = append(stAttrContent, derOIDSigningTime...)
-	stAttrContent = appendDERSet(stAttrContent, timeDER)
-	stAttr := appendDERSequence(nil, stAttrContent)
+	// Pre-compute all DER sizes bottom-up.
 
-	// Concatenate attributes in DER-sorted order.
-	// The OIDs sort as: contentType (.9.3) < messageDigest (.9.4) < signingTime (.9.5),
-	// so the order is always: contentTypeAttr, mdAttr, stAttr.
-	attrSetContent := make([]byte, 0, len(s.contentTypeAttr)+len(mdAttr)+len(stAttr))
-	attrSetContent = append(attrSetContent, s.contentTypeAttr...)
-	attrSetContent = append(attrSetContent, mdAttr...)
-	attrSetContent = append(attrSetContent, stAttr...)
+	// messageDigest attribute: SEQUENCE { OID, SET { OCTET STRING(hash) } }
+	mdValueLen := derTLVLen(hashLen)             // OCTET STRING
+	mdSetLen := derTLVLen(mdValueLen)            // SET { ... }
+	mdAttrContentLen := len(derOIDMsgDigest) + mdSetLen
+	mdAttrLen := derTLVLen(mdAttrContentLen) // SEQUENCE
 
-	// Build the SET wrapper for hashing (uses SET tag 0x31).
-	attrSetDER := appendDERSet(nil, attrSetContent)
+	// signingTime attribute: SEQUENCE { OID, SET { UTCTime } }
+	const utcTimeLen = 15                           // tag(1) + len(1) + 13 chars
+	stSetLen := derTLVLen(utcTimeLen)               // SET { UTCTime }
+	stAttrContentLen := len(derOIDSigningTime) + stSetLen
+	stAttrLen := derTLVLen(stAttrContentLen) // SEQUENCE
 
-	// Hash the attribute SET for signing with the same digest as SignerInfo.digestAlgorithm.
+	// Attribute set content (sorted by OID: contentType < messageDigest < signingTime)
+	attrSetContentLen := len(s.contentTypeAttr) + mdAttrLen + stAttrLen
+
+	// Get scratch buffer from pool.
+	bp := cmsPool.Get().(*[]byte)
+	scratch := (*bp)[:0]
+
+	// Phase A: Write attrSetContent into scratch[0:attrSetContentLen].
+
+	// contentType attribute (pre-computed)
+	scratch = append(scratch, s.contentTypeAttr...)
+
+	// messageDigest attribute
+	scratch = append(scratch, 0x30) // SEQUENCE
+	scratch = appendDERLength(scratch, mdAttrContentLen)
+	scratch = append(scratch, derOIDMsgDigest...)
+	scratch = append(scratch, 0x31) // SET
+	scratch = appendDERLength(scratch, mdValueLen)
+	scratch = append(scratch, 0x04) // OCTET STRING
+	scratch = appendDERLength(scratch, hashLen)
+	scratch = append(scratch, contentHash...)
+
+	// signingTime attribute
+	scratch = append(scratch, 0x30) // SEQUENCE
+	scratch = appendDERLength(scratch, stAttrContentLen)
+	scratch = append(scratch, derOIDSigningTime...)
+	scratch = append(scratch, 0x31) // SET
+	scratch = appendDERLength(scratch, utcTimeLen)
+	scratch = appendUTCTime(scratch, signingTime)
+
+	// Phase B: Write attrSetDER (SET wrapper + copy) for hashing.
+	attrSetDERStart := len(scratch)
+	attrSetDERLen := derTLVLen(attrSetContentLen)
+	scratch = append(scratch, 0x31) // SET tag
+	scratch = appendDERLength(scratch, attrSetContentLen)
+	scratch = append(scratch, scratch[:attrSetContentLen]...) // copy attrSetContent
+	attrSetDER := scratch[attrSetDERStart : attrSetDERStart+attrSetDERLen]
+
+	// Phase C: Hash and sign.
 	var attrHash []byte
 	if s.keyType == keyTypeECDSAP384 {
 		sum := sha512.Sum384(attrSetDER)
@@ -223,51 +278,92 @@ func (s *Signer) buildCMSSignature(contentHash []byte, signingTime time.Time) ([
 		attrHash = sum[:]
 	}
 
-	// Sign the hash.
 	sig, err := s.signHash(attrHash)
 	if err != nil {
+		*bp = scratch
+		cmsPool.Put(bp)
 		return nil, err
 	}
 
-	// Build signerInfo SEQUENCE content.
-	siContent := make([]byte, 0, 512)
-	siContent = append(siContent, derVersion1...)
-	siContent = append(siContent, s.issuerSerialDER...)
-	siContent = append(siContent, s.digestAlgDER...)
-	// [0] IMPLICIT CONSTRUCTED: authenticated attributes
-	siContent = appendDERContextTag(siContent, 0, attrSetContent, true)
-	siContent = append(siContent, s.digestEncAlgDER...)
-	siContent = appendDEROctetString(siContent, sig)
+	// Phase D: Compute remaining sizes with known signature length.
+	sigLen := len(sig)
+	authAttrsLen := derTLVLen(attrSetContentLen)
+	sigOctetLen := derTLVLen(sigLen)
 
-	// Wrap in SEQUENCE.
-	siDER := appendDERSequence(nil, siContent)
+	siContentLen := len(derVersion1) + len(s.issuerSerialDER) + len(s.digestAlgDER) +
+		authAttrsLen + len(s.digestEncAlgDER) + sigOctetLen
+	siDERLen := derTLVLen(siContentLen)
+	siSetLen := derTLVLen(siDERLen)
 
-	// Build signerInfos SET.
-	siSetDER := appendDERSet(nil, siDER)
+	sdContentLen := len(derVersion1) + len(s.digestAlgSetDER) + len(s.contentInfoDER) +
+		len(s.certTagDER) + siSetLen
+	sdDERLen := derTLVLen(sdContentLen)
+	explicitLen := derTLVLen(sdDERLen)
+	ciContentLen := len(s.oidSignedData) + explicitLen
+	totalLen := derTLVLen(ciContentLen)
 
-	// Build signedData SEQUENCE content.
-	sdContent := make([]byte, 0, len(s.digestAlgSetDER)+len(s.contentInfoDER)+len(s.certTagDER)+len(siSetDER)+16)
-	sdContent = append(sdContent, derVersion1...)
-	sdContent = append(sdContent, s.digestAlgSetDER...)
-	sdContent = append(sdContent, s.contentInfoDER...)
-	sdContent = append(sdContent, s.certTagDER...)
-	sdContent = append(sdContent, siSetDER...)
+	// Phase E: Write final CMS structure.
+	// Ensure capacity to avoid reallocation (preserves attrSetContent at scratch[0:]).
+	resultStart := len(scratch)
+	needed := resultStart + totalLen
+	if cap(scratch) < needed {
+		newScratch := make([]byte, len(scratch), needed)
+		copy(newScratch, scratch)
+		scratch = newScratch
+	}
 
-	// Wrap in SEQUENCE.
-	sdDER := appendDERSequence(nil, sdContent)
+	// Outer ContentInfo SEQUENCE
+	scratch = append(scratch, 0x30)
+	scratch = appendDERLength(scratch, ciContentLen)
+	scratch = append(scratch, s.oidSignedData...)
 
-	// Build [0] EXPLICIT wrapper for signedData.
-	explicitContent := appendDERContextTag(nil, 0, sdDER, true)
+	// [0] EXPLICIT CONSTRUCTED
+	scratch = append(scratch, 0xA0)
+	scratch = appendDERLength(scratch, sdDERLen)
 
-	// Build outer ContentInfo SEQUENCE.
-	ciContent := make([]byte, 0, len(s.oidSignedData)+len(explicitContent))
-	ciContent = append(ciContent, s.oidSignedData...)
-	ciContent = append(ciContent, explicitContent...)
+	// SignedData SEQUENCE
+	scratch = append(scratch, 0x30)
+	scratch = appendDERLength(scratch, sdContentLen)
+	scratch = append(scratch, derVersion1...)
+	scratch = append(scratch, s.digestAlgSetDER...)
+	scratch = append(scratch, s.contentInfoDER...)
+	scratch = append(scratch, s.certTagDER...)
 
-	return appendDERSequence(nil, ciContent), nil
+	// SignerInfos SET
+	scratch = append(scratch, 0x31)
+	scratch = appendDERLength(scratch, siDERLen)
+
+	// SignerInfo SEQUENCE
+	scratch = append(scratch, 0x30)
+	scratch = appendDERLength(scratch, siContentLen)
+	scratch = append(scratch, derVersion1...)
+	scratch = append(scratch, s.issuerSerialDER...)
+	scratch = append(scratch, s.digestAlgDER...)
+
+	// [0] IMPLICIT CONSTRUCTED (authenticated attributes)
+	scratch = append(scratch, 0xA0)
+	scratch = appendDERLength(scratch, attrSetContentLen)
+	scratch = append(scratch, scratch[:attrSetContentLen]...) // copy attrSetContent
+
+	scratch = append(scratch, s.digestEncAlgDER...)
+
+	// OCTET STRING (signature)
+	scratch = append(scratch, 0x04)
+	scratch = appendDERLength(scratch, sigLen)
+	scratch = append(scratch, sig...)
+
+	// Copy result out.
+	result := make([]byte, len(scratch)-resultStart)
+	copy(result, scratch[resultStart:])
+
+	// Return scratch to pool.
+	*bp = scratch
+	cmsPool.Put(bp)
+
+	return result, nil
 }
 
-// signHash signs a SHA-256 hash using the signer's private key.
+// signHash signs a hash using the signer's private key.
 func (s *Signer) signHash(hash []byte) ([]byte, error) {
 	switch s.keyType {
 	case keyTypeRSA:
@@ -285,33 +381,4 @@ func (s *Signer) signHash(hash []byte) ([]byte, error) {
 	default:
 		return nil, errors.New("unsupported key type")
 	}
-}
-
-// compareDER compares two DER-encoded byte slices lexicographically.
-func compareDER(a, b []byte) int {
-	minLen := len(a)
-	if len(b) < minLen {
-		minLen = len(b)
-	}
-	for i := 0; i < minLen; i++ {
-		if a[i] < b[i] {
-			return -1
-		}
-		if a[i] > b[i] {
-			return 1
-		}
-	}
-	if len(a) < len(b) {
-		return -1
-	}
-	if len(a) > len(b) {
-		return 1
-	}
-	return 0
-}
-
-// ASN.1 types used only for issuerAndSerialNumber pre-computation.
-type issuerAndSerial struct {
-	IssuerName   asn1.RawValue
-	SerialNumber *big.Int
 }

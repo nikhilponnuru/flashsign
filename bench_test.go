@@ -254,13 +254,15 @@ func BenchmarkBuildIncrement(b *testing.B) {
 	b.ReportAllocs()
 	b.ResetTimer()
 
+	bp := slicePool.Get().(*[]byte)
 	for i := 0; i < b.N; i++ {
-		incr, _, err := signer.buildIncrement(pi, int64(len(basePDF)), "Test", "", "", rect, true, signingTime)
+		incr, _, err := signer.buildIncrement(*bp, &pi, int64(len(basePDF)), "Test", "", "", rect, true, signingTime)
 		if err != nil {
 			b.Fatal(err)
 		}
-		slicePool.Put(incr[:0])
+		*bp = incr
 	}
+	slicePool.Put(bp)
 }
 
 func BenchmarkSignAndEncrypt(b *testing.B) {
