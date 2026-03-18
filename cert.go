@@ -1,6 +1,7 @@
 package flashsign
 
 import (
+	"bytes"
 	"crypto/ecdsa"
 	"crypto/elliptic"
 	"crypto/rsa"
@@ -8,6 +9,7 @@ import (
 	"encoding/pem"
 	"fmt"
 	"os"
+	"time"
 
 	"golang.org/x/crypto/pkcs12"
 	pkcs12modern "software.sslmate.com/src/go-pkcs12"
@@ -165,5 +167,34 @@ func NewSigner(cfg Config) (*Signer, error) {
 		return nil, fmt.Errorf("precompute CMS: %w", err)
 	}
 
+	// Size /Contents placeholder adaptively per certificate/key while keeping
+	// a conservative safety margin.
+	s.initContentsPlaceholder()
+
 	return s, nil
+}
+
+func (s *Signer) initContentsPlaceholder() {
+	s.contentsPlaceholderLen = defaultContentsPlaceholderLen
+
+	hashLen := 32
+	if s.keyType == keyTypeECDSAP384 {
+		hashLen = 48
+	}
+	digest := make([]byte, hashLen)
+
+	// Best-effort sizing; fallback to default on any failure.
+	if sig, err := s.buildCMSSignature(digest, time.Unix(0, 0).UTC()); err == nil {
+		need := len(sig)*2 + placeholderSafetyMarginHex
+		if need < minContentsPlaceholderLen {
+			need = minContentsPlaceholderLen
+		}
+		// Round up so future variation (eg, ECDSA DER length) still fits.
+		if rem := need % placeholderRoundUpHex; rem != 0 {
+			need += placeholderRoundUpHex - rem
+		}
+		s.contentsPlaceholderLen = need
+	}
+
+	s.contentsZeros = bytes.Repeat([]byte("0"), s.contentsPlaceholderLen)
 }

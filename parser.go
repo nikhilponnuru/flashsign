@@ -6,6 +6,7 @@ import (
 	"compress/zlib"
 	"fmt"
 	"io"
+	"sync"
 )
 
 // pdfInfo holds the minimal PDF metadata needed for signing.
@@ -32,8 +33,25 @@ type xrefEntry struct {
 	index       int
 }
 
+// Package-level keyword byte slices to avoid repeated string-to-bytes conversions.
+var (
+	kwObj       = []byte("obj")
+	kwXref      = []byte("xref")
+	kwTrailer   = []byte("trailer")
+	kwStream    = []byte("stream")
+	kwEndstream = []byte("endstream")
+	kwStartxref = []byte("startxref")
+	kwPage      = []byte("Page")
+)
+
+// xrefMapPool provides reusable maps for xref parsing.
+var xrefMapPool = sync.Pool{
+	New: func() any { return make(map[int]xrefEntry, 64) },
+}
+
 // parsePDF parses a PDF byte slice and extracts the minimal info needed for signing.
-func parsePDF(data []byte, targetPage int) (*pdfInfo, error) {
+// Returns pdfInfo by value (zero allocation for the struct).
+func parsePDF(data []byte, targetPage int) (pdfInfo, error) {
 	if targetPage < 1 {
 		targetPage = 1
 	}
@@ -41,35 +59,39 @@ func parsePDF(data []byte, targetPage int) (*pdfInfo, error) {
 	// Find startxref offset.
 	prevXrefOffset, err := findStartxref(data)
 	if err != nil {
-		return nil, fmt.Errorf("find startxref: %w", err)
+		return pdfInfo{}, fmt.Errorf("find startxref: %w", err)
 	}
 
 	// Parse xref chain to build complete object table.
 	xref, trailer, err := parseXrefChain(data, prevXrefOffset)
 	if err != nil {
-		return nil, fmt.Errorf("parse xref: %w", err)
+		return pdfInfo{}, fmt.Errorf("parse xref: %w", err)
 	}
+	defer func() {
+		clear(xref)
+		xrefMapPool.Put(xref)
+	}()
 
 	// Read catalog object.
 	catalogRaw, err := resolveObjectDict(data, xref, trailer.rootObjNr)
 	if err != nil {
-		return nil, fmt.Errorf("read catalog object %d: %w", trailer.rootObjNr, err)
+		return pdfInfo{}, fmt.Errorf("read catalog object %d: %w", trailer.rootObjNr, err)
 	}
 
 	// Extract /Pages reference from catalog.
 	pagesVal := extractDictValue(catalogRaw, "Pages")
 	if pagesVal == nil {
-		return nil, fmt.Errorf("catalog has no /Pages entry")
+		return pdfInfo{}, fmt.Errorf("catalog has no /Pages entry")
 	}
 	pagesObjNr, _, err := extractIndirectRef(pagesVal)
 	if err != nil {
-		return nil, fmt.Errorf("parse /Pages ref: %w", err)
+		return pdfInfo{}, fmt.Errorf("parse /Pages ref: %w", err)
 	}
 
 	// Walk page tree to find target page.
 	pageObjNr, pageRaw, err := resolvePageFromTree(data, xref, pagesObjNr, targetPage)
 	if err != nil {
-		return nil, fmt.Errorf("resolve page %d: %w", targetPage, err)
+		return pdfInfo{}, fmt.Errorf("resolve page %d: %w", targetPage, err)
 	}
 
 	// Extract existing /AcroForm /Fields if present.
@@ -101,7 +123,7 @@ func parsePDF(data []byte, targetPage int) (*pdfInfo, error) {
 		existingAnnots = resolveArrayContent(data, xref, annotsVal)
 	}
 
-	pi := &pdfInfo{
+	return pdfInfo{
 		nextObjNr:      trailer.size,
 		prevXrefOffset: prevXrefOffset,
 		catalogObjNr:   trailer.rootObjNr,
@@ -113,18 +135,17 @@ func parsePDF(data []byte, targetPage int) (*pdfInfo, error) {
 		infoObjNr:      trailer.infoObjNr,
 		infoGen:        trailer.infoGen,
 		idArray:        trailer.idArray,
-	}
-	return pi, nil
+	}, nil
 }
 
 // parsePDFReader parses a PDF from an io.ReadSeeker.
-func parsePDFReader(src io.ReadSeeker, srcSize int64, targetPage int) (*pdfInfo, error) {
+func parsePDFReader(src io.ReadSeeker, srcSize int64, targetPage int) (pdfInfo, error) {
 	if _, err := src.Seek(0, io.SeekStart); err != nil {
-		return nil, fmt.Errorf("seek start: %w", err)
+		return pdfInfo{}, fmt.Errorf("seek start: %w", err)
 	}
 	data := make([]byte, srcSize)
 	if _, err := io.ReadFull(src, data); err != nil {
-		return nil, fmt.Errorf("read source: %w", err)
+		return pdfInfo{}, fmt.Errorf("read source: %w", err)
 	}
 	return parsePDF(data, targetPage)
 }
@@ -138,12 +159,12 @@ func findStartxref(data []byte) (int64, error) {
 	}
 	tail := data[searchStart:]
 
-	idx := bytes.LastIndex(tail, []byte("startxref"))
+	idx := bytes.LastIndex(tail, kwStartxref)
 	if idx == -1 {
 		return 0, fmt.Errorf("startxref not found")
 	}
 
-	rest := tail[idx+len("startxref"):]
+	rest := tail[idx+len(kwStartxref):]
 	i := 0
 	for i < len(rest) && isSpace(rest[i]) {
 		i++
@@ -174,32 +195,30 @@ type trailerInfo struct {
 }
 
 // parseXrefChain follows the /Prev chain to build a complete xref table.
+// Uses a pooled map to avoid per-call map allocation.
 func parseXrefChain(data []byte, startOffset int64) (map[int]xrefEntry, trailerInfo, error) {
-	xref := make(map[int]xrefEntry)
+	xref := xrefMapPool.Get().(map[int]xrefEntry)
+	clear(xref)
+
 	var firstTrailer trailerInfo
 	first := true
 
 	offset := startOffset
 	for offset >= 0 {
-		var entries map[int]xrefEntry
 		var trailer trailerInfo
 		var err error
 
 		// Determine if this is a traditional xref table or xref stream.
-		if offset < int64(len(data)) && bytes.HasPrefix(data[offset:], []byte("xref")) {
-			entries, trailer, err = parseTraditionalXref(data, offset)
+		if offset < int64(len(data)) && bytes.HasPrefix(data[offset:], kwXref) {
+			trailer, err = parseTraditionalXref(data, offset, xref)
 		} else {
-			entries, trailer, err = parseXrefStream(data, offset)
+			trailer, err = parseXrefStream(data, offset, xref)
 		}
 		if err != nil {
+			// Return map to pool on error.
+			clear(xref)
+			xrefMapPool.Put(xref)
 			return nil, trailerInfo{}, fmt.Errorf("parse xref at offset %d: %w", offset, err)
-		}
-
-		// Merge entries: earlier entries take precedence (most recent xref wins).
-		for objNr, entry := range entries {
-			if _, exists := xref[objNr]; !exists {
-				xref[objNr] = entry
-			}
 		}
 
 		if first {
@@ -218,20 +237,20 @@ func parseXrefChain(data []byte, startOffset int64) (map[int]xrefEntry, trailerI
 }
 
 // parseTraditionalXref parses a traditional "xref\n..." cross-reference table.
-func parseTraditionalXref(data []byte, offset int64) (map[int]xrefEntry, trailerInfo, error) {
-	entries := make(map[int]xrefEntry)
+// Writes entries directly into xref with "first write wins" semantics.
+func parseTraditionalXref(data []byte, offset int64, xref map[int]xrefEntry) (trailerInfo, error) {
 	pos := int(offset)
 
 	// Skip "xref" keyword and whitespace.
-	if !bytes.HasPrefix(data[pos:], []byte("xref")) {
-		return nil, trailerInfo{}, fmt.Errorf("expected 'xref' at offset %d", offset)
+	if !bytes.HasPrefix(data[pos:], kwXref) {
+		return trailerInfo{}, fmt.Errorf("expected 'xref' at offset %d", offset)
 	}
 	pos += 4
 	pos = skipWhitespace(data, pos)
 
 	// Parse subsections until "trailer" keyword.
 	for pos < len(data) {
-		if bytes.HasPrefix(data[pos:], []byte("trailer")) {
+		if bytes.HasPrefix(data[pos:], kwTrailer) {
 			break
 		}
 
@@ -245,7 +264,7 @@ func parseTraditionalXref(data []byte, offset int64) (map[int]xrefEntry, trailer
 
 		count, n := parseInt(data, pos)
 		if n == 0 {
-			return nil, trailerInfo{}, fmt.Errorf("expected count in xref subsection")
+			return trailerInfo{}, fmt.Errorf("expected count in xref subsection")
 		}
 		pos += n
 		pos = skipWhitespace(data, pos)
@@ -253,7 +272,7 @@ func parseTraditionalXref(data []byte, offset int64) (map[int]xrefEntry, trailer
 		// Parse entries line by line (handles 20-byte and non-standard entries).
 		for i := 0; i < count; i++ {
 			if pos >= len(data) {
-				return nil, trailerInfo{}, fmt.Errorf("truncated xref entry")
+				return trailerInfo{}, fmt.Errorf("truncated xref entry")
 			}
 			// Find end of line.
 			lineEnd := pos
@@ -290,42 +309,45 @@ func parseTraditionalXref(data []byte, offset int64) (map[int]xrefEntry, trailer
 
 			objNr := startObjNr + i
 			if inUse && objNr > 0 {
-				entries[objNr] = xrefEntry{offset: entryOffset, gen: gen}
+				if _, exists := xref[objNr]; !exists {
+					xref[objNr] = xrefEntry{offset: entryOffset, gen: gen}
+				}
 			}
 		}
 		pos = skipWhitespace(data, pos)
 	}
 
 	// Parse trailer dict.
-	trailerPos := bytes.Index(data[pos:], []byte("trailer"))
+	trailerPos := bytes.Index(data[pos:], kwTrailer)
 	if trailerPos == -1 {
-		return nil, trailerInfo{}, fmt.Errorf("trailer not found")
+		return trailerInfo{}, fmt.Errorf("trailer not found")
 	}
 	pos += trailerPos + 7
 	pos = skipWhitespace(data, pos)
 
 	trailer, err := parseTrailerDict(data, pos)
 	if err != nil {
-		return nil, trailerInfo{}, err
+		return trailerInfo{}, err
 	}
 
-	return entries, trailer, nil
+	return trailer, nil
 }
 
 // parseXrefStream parses a cross-reference stream object (PDF 1.5+).
-func parseXrefStream(data []byte, offset int64) (map[int]xrefEntry, trailerInfo, error) {
+// Writes entries directly into xref with "first write wins" semantics.
+func parseXrefStream(data []byte, offset int64, xref map[int]xrefEntry) (trailerInfo, error) {
 	pos := int(offset)
 
 	// Skip object header: "N G obj"
-	pos = skipPastKeyword(data, pos, "obj")
+	pos = skipPastKeyword(data, pos, kwObj)
 	if pos < 0 {
-		return nil, trailerInfo{}, fmt.Errorf("obj keyword not found at offset %d", offset)
+		return trailerInfo{}, fmt.Errorf("obj keyword not found at offset %d", offset)
 	}
 
 	// Read the stream dict.
 	dictContent, dictEnd, err := readDictAt(data, pos)
 	if err != nil {
-		return nil, trailerInfo{}, fmt.Errorf("read xref stream dict: %w", err)
+		return trailerInfo{}, fmt.Errorf("read xref stream dict: %w", err)
 	}
 
 	// Extract trailer fields from the stream dict (which serves as the trailer).
@@ -334,19 +356,19 @@ func parseXrefStream(data []byte, offset int64) (map[int]xrefEntry, trailerInfo,
 	// Extract /W array (column widths).
 	wVal := extractDictValue(dictContent, "W")
 	if wVal == nil {
-		return nil, trailerInfo{}, fmt.Errorf("xref stream missing /W")
+		return trailerInfo{}, fmt.Errorf("xref stream missing /W")
 	}
 	wArr := extractArrayContent(wVal)
 	if wArr == nil {
-		return nil, trailerInfo{}, fmt.Errorf("invalid /W array")
+		return trailerInfo{}, fmt.Errorf("invalid /W array")
 	}
 	w := parseIntArray(wArr)
 	if len(w) < 3 {
-		return nil, trailerInfo{}, fmt.Errorf("/W array must have 3 elements, got %d", len(w))
+		return trailerInfo{}, fmt.Errorf("/W array must have 3 elements, got %d", len(w))
 	}
 	entrySize := w[0] + w[1] + w[2]
 	if entrySize == 0 {
-		return nil, trailerInfo{}, fmt.Errorf("invalid /W entry size")
+		return trailerInfo{}, fmt.Errorf("invalid /W entry size")
 	}
 
 	// Extract /Index array (optional, defaults to [0 Size]).
@@ -368,11 +390,10 @@ func parseXrefStream(data []byte, offset int64) (map[int]xrefEntry, trailerInfo,
 	// Read and decompress stream data.
 	streamData, err := readStreamData(data, dictContent, dictEnd)
 	if err != nil {
-		return nil, trailerInfo{}, fmt.Errorf("read xref stream data: %w", err)
+		return trailerInfo{}, fmt.Errorf("read xref stream data: %w", err)
 	}
 
-	// Parse entries from stream data.
-	entries := make(map[int]xrefEntry)
+	// Parse entries from stream data — write directly into xref.
 	dataPos := 0
 	for _, pair := range indexPairs {
 		startObj := pair[0]
@@ -390,18 +411,22 @@ func parseXrefStream(data []byte, offset int64) (map[int]xrefEntry, trailerInfo,
 			switch {
 			case w[0] == 0 || entryType == 1: // type 1: regular object
 				if objNr > 0 {
-					entries[objNr] = xrefEntry{offset: int64(field2), gen: int(field3)}
+					if _, exists := xref[objNr]; !exists {
+						xref[objNr] = xrefEntry{offset: int64(field2), gen: int(field3)}
+					}
 				}
 			case entryType == 2: // type 2: compressed object
 				if objNr > 0 {
-					entries[objNr] = xrefEntry{compressed: true, objStreamNr: int(field2), index: int(field3)}
+					if _, exists := xref[objNr]; !exists {
+						xref[objNr] = xrefEntry{compressed: true, objStreamNr: int(field2), index: int(field3)}
+					}
 				}
 			}
 			// type 0: free entry, skip
 		}
 	}
 
-	return entries, trailer, nil
+	return trailer, nil
 }
 
 // readUint reads an unsigned integer from n big-endian bytes.
@@ -419,7 +444,7 @@ func readStreamData(data []byte, dictContent []byte, dictEnd int) ([]byte, error
 	pos = skipWhitespace(data, pos)
 
 	// Expect "stream" keyword.
-	if !bytes.HasPrefix(data[pos:], []byte("stream")) {
+	if !bytes.HasPrefix(data[pos:], kwStream) {
 		return nil, fmt.Errorf("expected 'stream' keyword at %d", pos)
 	}
 	pos += 6
@@ -432,7 +457,7 @@ func readStreamData(data []byte, dictContent []byte, dictEnd int) ([]byte, error
 	}
 
 	// Find "endstream".
-	endIdx := bytes.Index(data[pos:], []byte("endstream"))
+	endIdx := bytes.Index(data[pos:], kwEndstream)
 	if endIdx == -1 {
 		return nil, fmt.Errorf("endstream not found")
 	}
@@ -512,7 +537,7 @@ func readDictAt(data []byte, pos int) ([]byte, int, error) {
 	for pos < len(data) && depth > 0 {
 		b := data[pos]
 		switch {
-		case b == '(' :
+		case b == '(':
 			// Skip string literal.
 			pos++
 			for pos < len(data) {
@@ -564,7 +589,7 @@ func resolveObjectDict(data []byte, xref map[int]xrefEntry, objNr int) ([]byte, 
 // readObjectDictAt reads the dict content of a regular object at the given offset.
 func readObjectDictAt(data []byte, offset int64) ([]byte, error) {
 	pos := int(offset)
-	pos = skipPastKeyword(data, pos, "obj")
+	pos = skipPastKeyword(data, pos, kwObj)
 	if pos < 0 {
 		return nil, fmt.Errorf("obj keyword not found at offset %d", offset)
 	}
@@ -584,7 +609,7 @@ func readCompressedObject(data []byte, xref map[int]xrefEntry, objStreamNr int, 
 	}
 
 	pos := int(streamEntry.offset)
-	pos = skipPastKeyword(data, pos, "obj")
+	pos = skipPastKeyword(data, pos, kwObj)
 	if pos < 0 {
 		return nil, fmt.Errorf("obj keyword not found for object stream %d", objStreamNr)
 	}
@@ -618,10 +643,10 @@ func readCompressedObject(data []byte, xref map[int]xrefEntry, objStreamNr int, 
 	hpos := 0
 	for i := 0; i < n; i++ {
 		hpos = skipWhitespaceInSlice(streamData, hpos)
-		objNr, nn := parseIntInSlice(streamData, hpos)
+		objNr, nn := parseInt(streamData, hpos)
 		hpos += nn
 		hpos = skipWhitespaceInSlice(streamData, hpos)
-		off, nn := parseIntInSlice(streamData, hpos)
+		off, nn := parseInt(streamData, hpos)
 		hpos += nn
 		entries = append(entries, objEntry{objNr: objNr, offset: first + off})
 	}
@@ -953,7 +978,7 @@ func resolveArrayContent(data []byte, xref map[int]xrefEntry, val []byte) []byte
 			return nil
 		}
 		pos := int(entry.offset)
-		pos = skipPastKeyword(data, pos, "obj")
+		pos = skipPastKeyword(data, pos, kwObj)
 		if pos < 0 {
 			return nil
 		}
@@ -984,12 +1009,9 @@ func walkPageTree(data []byte, xref map[int]xrefEntry, objNr int, targetPage int
 	}
 
 	typeVal := extractDictValue(dict, "Type")
-	typeName := ""
-	if typeVal != nil {
-		typeName = string(bytes.TrimLeft(bytes.TrimSpace(typeVal), "/"))
-	}
 
-	if typeName == "Page" {
+	// Compare type without string conversion (zero-alloc).
+	if isNameEqual(typeVal, kwPage) {
 		if targetPage == 1 {
 			return objNr, dict, nil
 		}
@@ -1006,8 +1028,9 @@ func walkPageTree(data []byte, xref map[int]xrefEntry, objNr int, targetPage int
 		return 0, nil, fmt.Errorf("invalid /Kids array in Pages node %d", objNr)
 	}
 
-	// Parse indirect refs from Kids array.
-	kidRefs := parseIndirectRefs(kidsContent)
+	// Parse indirect refs from Kids array (stack buffer avoids alloc for typical trees).
+	var kidBuf [16]int
+	kidRefs := parseIndirectRefs(kidsContent, kidBuf[:0])
 	currentPage := 0
 
 	for _, kidObjNr := range kidRefs {
@@ -1017,13 +1040,9 @@ func walkPageTree(data []byte, xref map[int]xrefEntry, objNr int, targetPage int
 		}
 
 		kidType := extractDictValue(kidDict, "Type")
-		kidTypeName := ""
-		if kidType != nil {
-			kidTypeName = string(bytes.TrimLeft(bytes.TrimSpace(kidType), "/"))
-		}
 
 		count := 0
-		if kidTypeName == "Page" {
+		if isNameEqual(kidType, kwPage) {
 			count = 1
 		} else if cVal := extractDictValue(kidDict, "Count"); cVal != nil {
 			count, _ = parseInt(cVal, skipWhitespaceInSlice(cVal, 0))
@@ -1038,10 +1057,22 @@ func walkPageTree(data []byte, xref map[int]xrefEntry, objNr int, targetPage int
 	return 0, nil, fmt.Errorf("page %d not found in tree", targetPage)
 }
 
+// isNameEqual checks if a PDF name value (like "/Page") equals the given name (like "Page").
+// Zero-allocation: compares bytes directly without string conversion.
+func isNameEqual(val []byte, name []byte) bool {
+	if val == nil {
+		return false
+	}
+	val = bytes.TrimSpace(val)
+	if len(val) > 0 && val[0] == '/' {
+		val = val[1:]
+	}
+	return bytes.Equal(val, name)
+}
+
 // parseIndirectRefs extracts all "N G R" patterns from array content bytes.
-// Zero-allocation: walks bytes directly instead of using bytes.Fields.
-func parseIndirectRefs(content []byte) []int {
-	var refs []int
+// Accepts a pre-allocated buffer to avoid heap allocation for small arrays.
+func parseIndirectRefs(content []byte, refs []int) []int {
 	pos := 0
 	for {
 		pos = skipWhitespaceInSlice(content, pos)
@@ -1120,13 +1151,14 @@ func skipWhitespaceInSlice(data []byte, pos int) int {
 	return pos
 }
 
-func skipPastKeyword(data []byte, pos int, keyword string) int {
-	kw := []byte(keyword)
-	idx := bytes.Index(data[pos:], kw)
+// skipPastKeyword finds keyword in data starting at pos and returns the position
+// after the keyword plus any trailing whitespace. Uses []byte keyword to avoid allocation.
+func skipPastKeyword(data []byte, pos int, keyword []byte) int {
+	idx := bytes.Index(data[pos:], keyword)
 	if idx == -1 {
 		return -1
 	}
-	result := pos + idx + len(kw)
+	result := pos + idx + len(keyword)
 	// Skip whitespace after keyword.
 	for result < len(data) && isSpace(data[result]) {
 		result++
@@ -1153,10 +1185,6 @@ func parseInt(data []byte, pos int) (int, int) {
 		val = -val
 	}
 	return val, pos - start
-}
-
-func parseIntInSlice(data []byte, pos int) (int, int) {
-	return parseInt(data, pos)
 }
 
 func parseIntArray(content []byte) []int {

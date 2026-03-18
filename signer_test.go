@@ -69,6 +69,78 @@ func TestSignVisible(t *testing.T) {
 	}
 }
 
+func TestSignVisibleWithReversedRect(t *testing.T) {
+	signer, err := NewSignerFromPFX(filepath.Join("testdata", "test.pfx"), "test123")
+	if err != nil {
+		t.Fatalf("create signer: %v", err)
+	}
+
+	visible := true
+	// Same coordinate style as jpdfsigner config: y1 > y2.
+	rect := Rectangle{X1: 0, Y1: 609, X2: 278, Y2: 550}
+	outPath := filepath.Join(t.TempDir(), "signed-visible-reversed-rect.pdf")
+
+	err = signer.Sign(SignParams{
+		Src:     filepath.Join("testdata", "test.pdf"),
+		Dest:    outPath,
+		Visible: &visible,
+		Rect:    &rect,
+	})
+	if err != nil {
+		t.Fatalf("Sign returned error: %v", err)
+	}
+
+	outData, err := os.ReadFile(outPath)
+	if err != nil {
+		t.Fatalf("read output file: %v", err)
+	}
+	if !bytes.Contains(outData, []byte("/Rect [0 550 278 609]")) {
+		t.Fatal("output missing normalized /Rect for reversed coordinates")
+	}
+	if bytes.Contains(outData, []byte("/BBox [0 0 278 -59]")) {
+		t.Fatal("output contains negative BBox height")
+	}
+}
+
+func TestSignXRefStreamSourceCompat(t *testing.T) {
+	signer, err := NewSignerFromPFX(filepath.Join("testdata", "Zerodha.pfx"), "Newton_90356%")
+	if err != nil {
+		t.Fatalf("create signer: %v", err)
+	}
+
+	visible := true
+	// Same values as contract-note config; normalization should handle y1 > y2.
+	rect := Rectangle{X1: 0, Y1: 609, X2: 278, Y2: 550}
+	outPath := filepath.Join(t.TempDir(), "mcx-SUN844.signed.pdf")
+
+	err = signer.Sign(SignParams{
+		Src:      filepath.Join("testdata", "mcx-SUN844.pdf"),
+		Dest:     outPath,
+		Reason:   "Regulatory",
+		Contact:  "Zerodha Broking Limited",
+		Location: "Zerodha Broking Limited, Bangalore",
+		Visible:  &visible,
+		Rect:     &rect,
+	})
+	if err != nil {
+		t.Fatalf("Sign returned error: %v", err)
+	}
+
+	outData, err := os.ReadFile(outPath)
+	if err != nil {
+		t.Fatalf("read output file: %v", err)
+	}
+	if !bytes.Contains(outData, []byte("adbe.pkcs7.detached")) || !bytes.Contains(outData, []byte("ByteRange")) {
+		t.Fatal("output missing signature markers")
+	}
+	if bytes.Contains(outData, []byte("/Type/XRef")) {
+		t.Fatal("output still contains xref stream marker; expected compatibility rewrite")
+	}
+	if !bytes.Contains(outData, []byte("/Rect [0 550 278 609]")) {
+		t.Fatal("output missing normalized /Rect")
+	}
+}
+
 func TestSignBytes(t *testing.T) {
 	signer, err := NewSignerFromPFX(filepath.Join("testdata", "test.pfx"), "test123")
 	if err != nil {

@@ -1,6 +1,6 @@
 # flashsign
 
-High-performance PDF digital signing library and CLI in Go.
+High-performance PDF digital signing library and CLI in Go. Drop-in replacement for [jpdfsigner](https://github.com/zerodha/jpdfsigner) — rewritten in Go with near-zero allocations.
 
 ## Features
 
@@ -10,9 +10,11 @@ High-performance PDF digital signing library and CLI in Go.
 - PFX (PKCS#12) and PEM certificate loading
 - `config.ini` support for easy deployment
 - Custom PDF parser — no pdfcpu in the signing hot path
-- Pre-computed CMS/DER fragments for zero-alloc signing
+- Near-zero-allocation signing (5 allocs/op RSA, 0 allocs for parser and increment builder)
+- Pooled CMS scratch buffers and xref maps for minimal GC pressure
 - Concurrent batch signing
 - Streaming and in-memory signing APIs
+- Production-hardened HTTP server (graceful shutdown, concurrency limiter, health endpoint)
 
 ## Build
 
@@ -50,11 +52,44 @@ Then sign with:
 ./flashsign sign -config config.ini -src input.pdf -dest output.pdf
 ```
 
+Start HTTP signer server (`/sign` endpoint + `/health`):
+
+```bash
+./flashsign serve -config config.ini -pfx ./testdata/Zerodha.pfx
+```
+
+The server provides:
+- `POST /sign` — sign (and optionally encrypt) a PDF
+- `GET /health` — returns `200 ok` (for load balancer health checks)
+- Graceful shutdown on SIGINT/SIGTERM (10s drain)
+- Concurrency limiter (default: `NumCPU*2`, configurable via `-max-concurrent`)
+- Request body size limit (1MB)
+
+`/sign` request contract:
+
+```json
+{
+  "input_file": "/path/to/input.pdf",
+  "output_file": "/path/to/output.pdf",
+  "password": "optional-password-for-encryption",
+  "reason": "optional override",
+  "contact": "optional override",
+  "location": "optional override",
+  "page": 1,
+  "coordinates": { "x1": 0, "y1": 609, "x2": 278, "y2": 550 }
+}
+```
+
 Sign and encrypt:
 
 ```bash
 ./flashsign encrypt -config config.ini -src input.pdf -dest output.pdf -password "clientPAN123"
 ```
+
+Signing vs password locking:
+
+- `sign`: adds a digital PKCS#7 signature to the PDF (tamper detection + signer identity).
+- `encrypt` or HTTP `/sign` with `"password"`: signs first, then AES-encrypts the PDF (password-protected open).
 
 Flags override config values, so you can use the config for defaults and override per-invocation:
 
@@ -127,8 +162,16 @@ key=key.pem
 | `y1` | Signature box bottom Y coordinate |
 | `x2` | Signature box right X coordinate |
 | `y2` | Signature box top Y coordinate |
+| `server` | If `true`, running `flashsign` with no args starts HTTP server from `config.ini` |
+| `server_host` | HTTP server host (default: `localhost`) |
+| `server_port` | HTTP server port (default: `8090`) |
 
 Setting any coordinate (`x1`/`x2`) automatically enables visible signature.
+
+Relative paths in `keyfile`/`cert`/`key` are resolved in this order:
+1) directory of the `-config` file
+2) current working directory
+3) directory of `-src` (for sign/encrypt CLI mode)
 
 Coordinates use the PDF coordinate system: `(0,0)` is at the bottom-left of the page. `x1,y1` is the bottom-left corner and `x2,y2` is the top-right corner of the signature box.
 
@@ -137,6 +180,7 @@ Coordinates use the PDF coordinate system: `(0,0)` is at the bottom-left of the 
 ```
 flashsign sign    [flags]   Sign a PDF
 flashsign encrypt [flags]   Sign and encrypt a PDF
+flashsign serve   [flags]   Start HTTP signer server (`/sign`)
 
 Common flags:
   -config string     Path to config.ini (optional, flags override config values)
@@ -161,6 +205,18 @@ Sign flags:
 Encrypt flags:
   -password string   Encryption password (required for encrypt)
   -aes256            Use AES-256 instead of AES-128
+
+Serve flags:
+  -host string           Listen host (default: localhost; config key: server_host)
+  -port int              Listen port (default: 8090; config key: server_port)
+  -max-concurrent int    Max concurrent sign operations (default: NumCPU*2)
+```
+
+Compatibility mode (no-args startup):
+
+```bash
+# If ./config.ini has server=true, this starts the /sign server.
+./flashsign
 ```
 
 ## Library usage
@@ -245,6 +301,19 @@ for _, item := range items {
 }
 ```
 
+## Performance
+
+Benchmarked on Apple M4 Pro, Go 1.25, RSA-2048 key:
+
+| Operation | ns/op | allocs/op | B/op |
+|---|---|---|---|
+| SignBytes (10KB PDF) | 780μs | 5 | 18KB |
+| SignBytes (1MB PDF) | 1.15ms | 6 | 1.0MB |
+| ParsePDF | 1.4μs | 0 | 0 |
+| BuildIncrement | 0.98μs | 0 | 0 |
+| CMS/PKCS7 Signature | 768μs | 3 | 1.9KB |
+| Parallel Visible Sign (10KB, 14 cores) | 92μs | 5 | 18KB |
+
 ## Test and benchmark guide
 
 ### 1) Quick correctness checks
@@ -304,7 +373,33 @@ cp ./testdata/mcx-SUN844.pdf /tmp/mcx-SUN844.inplace.pdf
   -dest /tmp/mcx-SUN844.inplace.pdf
 ```
 
-### 3) Benchmarking
+### 3) HTTP server smoke test
+
+Start server:
+
+```bash
+./flashsign serve -config ./config.ini -pfx ./testdata/Zerodha.pfx -host 127.0.0.1 -port 18090
+```
+
+Send request:
+
+```bash
+curl -sS -X POST http://127.0.0.1:18090/sign \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "input_file":"./testdata/mcx-SUN844.pdf",
+    "output_file":"/tmp/mcx-SUN844.http.signed.pdf",
+    "password":"clientPAN123"
+  }'
+```
+
+Check signature markers:
+
+```bash
+rg -a -n "ByteRange|adbe\\.pkcs7\\.detached|/Rect|/BBox" /tmp/mcx-SUN844.http.signed.pdf
+```
+
+### 4) Benchmarking
 
 Run full benchmark suite:
 
@@ -326,7 +421,7 @@ Run parallel throughput benchmark:
 go test -run '^$' -bench 'BenchmarkSignBytesVisibleParallel$' -benchmem -count=3
 ```
 
-### 4) Saving and comparing benchmark runs
+### 5) Saving and comparing benchmark runs
 
 Save current run:
 
