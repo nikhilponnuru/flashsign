@@ -42,15 +42,28 @@ func (s *Signer) buildIncrement(buf []byte, pi *pdfInfo, srcSize int64, reason, 
 		nextObj++
 	}
 
+	// Tagged (accessible) documents need /DisplayDocTitle plus /Tabs /S on the
+	// page that receives the signature widget. See accessibility.go.
+	addDisplayDocTitle := pi.tagged
+	inlineViewerPrefs := addDisplayDocTitle && pi.viewerPrefsObjNr == 0
+	// Only rewrite the /ViewerPreferences object when it is a distinct, existing
+	// object; otherwise leave viewer preferences untouched rather than risk
+	// emitting a duplicate or colliding object.
+	updateViewerPrefsObj := addDisplayDocTitle && pi.viewerPrefsObjNr > 0 &&
+		pi.viewerPrefsObjNr != pi.catalogObjNr && pi.viewerPrefsObjNr != pi.pageObjNr &&
+		pi.viewerPrefsObjNr < pi.nextObjNr
+	addTabs := pi.tagged && !pi.pageHasTabs
+
 	buf = buf[:0]
 	buf = append(buf, '\n')
 
-	// Track xref entries in a fixed-size array (max 6 objects: sig, widget, appearance, font, catalog, page).
+	// Track xref entries in a fixed-size array (max 7 objects: sig, widget,
+	// appearance, font, catalog, page, viewer preferences).
 	type xrefEnt struct {
 		objNr  int
 		offset int64
 	}
-	var xrefEntries [6]xrefEnt
+	var xrefEntries [7]xrefEnt
 	xrefCount := 0
 	baseOffset := srcSize
 
@@ -105,6 +118,12 @@ func (s *Signer) buildIncrement(buf []byte, pi *pdfInfo, srcSize int64, reason, 
 	buf = append(buf, " 0 R\n/F 132\n/P "...)
 	buf = appendInt(buf, pi.pageObjNr)
 	buf = append(buf, " 0 R\n"...)
+	if pi.tagged {
+		// Alternate field description for assistive technology (PDF/UA-1 7.18.6.2).
+		buf = append(buf, "/TU ("...)
+		buf = appendPDFEscaped(buf, signatureFieldDescription)
+		buf = append(buf, ")\n"...)
+	}
 	if visible && rect.X1 != rect.X2 && rect.Y1 != rect.Y2 {
 		buf = append(buf, "/Rect ["...)
 		buf = appendFloat(buf, rect.X1)
@@ -160,8 +179,14 @@ func (s *Signer) buildIncrement(buf []byte, pi *pdfInfo, srcSize int64, reason, 
 	recordOffset(pi.catalogObjNr)
 	buf = appendInt(buf, pi.catalogObjNr)
 	buf = append(buf, " 0 obj\n<<"...)
-	// Copy raw catalog dict, removing /AcroForm.
-	buf = appendDictWithoutKey(buf, pi.catalogRaw, kwSlashAcroForm)
+	// Copy raw catalog dict, removing /AcroForm (and /ViewerPreferences when it
+	// is rewritten inline below). Everything else — /StructTreeRoot, /MarkInfo,
+	// /Lang, /Metadata, /Outlines — is preserved verbatim.
+	if inlineViewerPrefs {
+		buf = appendDictWithoutKeys2(buf, pi.catalogRaw, kwSlashAcroForm, kwSlashViewerPreferences)
+	} else {
+		buf = appendDictWithoutKey(buf, pi.catalogRaw, kwSlashAcroForm)
+	}
 	buf = append(buf, "\n/AcroForm << /Fields ["...)
 	if pi.existingFields != nil && len(pi.existingFields) > 0 {
 		buf = append(buf, ' ')
@@ -170,13 +195,31 @@ func (s *Signer) buildIncrement(buf []byte, pi *pdfInfo, srcSize int64, reason, 
 	buf = append(buf, ' ')
 	buf = appendInt(buf, widgetObjNr)
 	buf = append(buf, " 0 R] /SigFlags 3 >>"...)
+	if inlineViewerPrefs {
+		// Preserve existing viewer preferences (eg /Direction) and force
+		// /DisplayDocTitle true for tagged documents.
+		buf = append(buf, kwViewerPreferencesPrefix...)
+		buf = appendDictWithoutKey(buf, pi.viewerPrefsRaw, kwSlashDisplayDocTitle)
+		buf = append(buf, kwDisplayDocTitleTrue...)
+	}
 	buf = append(buf, "\n>>\nendobj\n\n"...)
+
+	// === Modified /ViewerPreferences object (when referenced indirectly) ===
+	if updateViewerPrefsObj {
+		recordOffset(pi.viewerPrefsObjNr)
+		buf = appendInt(buf, pi.viewerPrefsObjNr)
+		buf = append(buf, " 0 obj\n<<"...)
+		buf = appendDictWithoutKey(buf, pi.viewerPrefsRaw, kwSlashDisplayDocTitle)
+		buf = append(buf, kwDisplayDocTitleTrue...)
+		buf = append(buf, "\nendobj\n\n"...)
+	}
 
 	// === Modified Page ===
 	recordOffset(pi.pageObjNr)
 	buf = appendInt(buf, pi.pageObjNr)
 	buf = append(buf, " 0 obj\n<<"...)
-	// Copy raw page dict, removing /Annots.
+	// Copy raw page dict, removing /Annots. /StructParents and an existing
+	// /Tabs are preserved verbatim.
 	buf = appendDictWithoutKey(buf, pi.pageRaw, kwSlashAnnots)
 	buf = append(buf, "\n/Annots ["...)
 	if pi.existingAnnots != nil && len(pi.existingAnnots) > 0 {
@@ -186,6 +229,11 @@ func (s *Signer) buildIncrement(buf []byte, pi *pdfInfo, srcSize int64, reason, 
 	buf = append(buf, ' ')
 	buf = appendInt(buf, widgetObjNr)
 	buf = append(buf, " 0 R]"...)
+	if addTabs {
+		// The signature widget is an annotation on this page, so tab order must
+		// follow the structure tree (PDF/UA-1 7.18.3).
+		buf = append(buf, kwTabsStructure...)
+	}
 	buf = append(buf, "\n>>\nendobj\n\n"...)
 
 	// === Cross-reference table ===
@@ -239,10 +287,54 @@ func (s *Signer) buildIncrement(buf []byte, pi *pdfInfo, srcSize int64, reason, 
 // appendDictWithoutKey copies raw dict content to buf, removing the specified key entry.
 // key must be a package-level []byte like kwSlashAcroForm (avoids string alloc).
 func appendDictWithoutKey(buf []byte, raw []byte, key []byte) []byte {
-	pos := findTopLevelKey(raw, key)
-	if pos < 0 {
+	entryStart, valueEnd := dictKeyRange(raw, key)
+	if entryStart < 0 {
 		// Key not found, copy everything.
 		return append(buf, raw...)
+	}
+
+	// Copy before + after the entry.
+	buf = append(buf, raw[:entryStart]...)
+	buf = append(buf, raw[valueEnd:]...)
+	return buf
+}
+
+// appendDictWithoutKeys2 copies raw dict content to buf, removing both key entries.
+func appendDictWithoutKeys2(buf []byte, raw []byte, keyA, keyB []byte) []byte {
+	startA, endA := dictKeyRange(raw, keyA)
+	startB, endB := dictKeyRange(raw, keyB)
+
+	if startA < 0 {
+		return appendDictWithoutKey(buf, raw, keyB)
+	}
+	if startB < 0 {
+		return appendDictWithoutKey(buf, raw, keyA)
+	}
+
+	// Order the two removal ranges.
+	if startB < startA {
+		startA, endA, startB, endB = startB, endB, startA, endA
+	}
+
+	buf = append(buf, raw[:startA]...)
+	if startB > endA {
+		buf = append(buf, raw[endA:startB]...)
+	}
+	if endB > endA {
+		buf = append(buf, raw[endB:]...)
+	} else {
+		buf = append(buf, raw[endA:]...)
+	}
+	return buf
+}
+
+// dictKeyRange returns the byte range [entryStart, valueEnd) covering a
+// top-level /Key plus its value inside raw dict content, or (-1, -1) when the
+// key is absent. entryStart includes whitespace preceding the key.
+func dictKeyRange(raw []byte, key []byte) (int, int) {
+	pos := findTopLevelKey(raw, key)
+	if pos < 0 {
+		return -1, -1
 	}
 
 	// Find the start of this entry (trim preceding newline/space).
@@ -251,20 +343,13 @@ func appendDictWithoutKey(buf []byte, raw []byte, key []byte) []byte {
 		entryStart--
 	}
 
-	// Skip past the key.
+	// Skip past the key and any whitespace before the value.
 	keyEnd := pos + len(key)
-	// Skip whitespace after key.
-	for keyEnd < len(raw) && raw[keyEnd] == ' ' {
+	for keyEnd < len(raw) && isSpace(raw[keyEnd]) {
 		keyEnd++
 	}
 
-	// Find end of value.
-	valueEnd := findValueEnd(raw, keyEnd)
-
-	// Copy before + after the entry.
-	buf = append(buf, raw[:entryStart]...)
-	buf = append(buf, raw[valueEnd:]...)
-	return buf
+	return entryStart, findValueEnd(raw, keyEnd)
 }
 
 // findTopLevelKey finds a /Key at the top level (depth 0) of dict content.
