@@ -22,6 +22,12 @@ type pdfInfo struct {
 	infoObjNr      int    // /Info object number, or 0
 	infoGen        int    // /Info generation
 	idArray        []byte // raw /ID array bytes including [ ], or nil
+
+	// Accessibility (tagged PDF) related state.
+	tagged           bool   // /StructTreeRoot present or /MarkInfo << /Marked true >>
+	viewerPrefsObjNr int    // object number when /ViewerPreferences is an indirect ref, else 0
+	viewerPrefsRaw   []byte // raw /ViewerPreferences dict content, or nil when absent
+	pageHasTabs      bool   // target page already has a top-level /Tabs entry
 }
 
 // xrefEntry represents a cross-reference entry.
@@ -123,6 +129,9 @@ func parsePDF(data []byte, targetPage int) (pdfInfo, error) {
 		existingAnnots = resolveArrayContent(data, xref, annotsVal)
 	}
 
+	// Accessibility state: tagged documents need /DisplayDocTitle and /Tabs /S.
+	vpObjNr, vpRaw := resolveViewerPrefs(data, xref, catalogRaw)
+
 	return pdfInfo{
 		nextObjNr:      trailer.size,
 		prevXrefOffset: prevXrefOffset,
@@ -135,6 +144,11 @@ func parsePDF(data []byte, targetPage int) (pdfInfo, error) {
 		infoObjNr:      trailer.infoObjNr,
 		infoGen:        trailer.infoGen,
 		idArray:        trailer.idArray,
+
+		tagged:           isTaggedCatalog(data, xref, catalogRaw),
+		viewerPrefsObjNr: vpObjNr,
+		viewerPrefsRaw:   vpRaw,
+		pageHasTabs:      findTopLevelKey(pageRaw, kwSlashTabs) >= 0,
 	}, nil
 }
 
@@ -731,9 +745,10 @@ func extractDictValue(dict []byte, key string) []byte {
 			endOfKey := i + len(keyBytes)
 			// Ensure the key is followed by a delimiter.
 			if endOfKey >= len(dict) || isPDFDelimiter(dict[endOfKey]) {
-				// Extract the value starting after the key.
+				// Extract the value starting after the key. Skip all whitespace so
+				// pretty-printed dicts ("/Key\n<< ... >>") resolve correctly too.
 				valStart := endOfKey
-				for valStart < len(dict) && dict[valStart] == ' ' {
+				for valStart < len(dict) && isSpace(dict[valStart]) {
 					valStart++
 				}
 				valEnd := findValueEnd(dict, valStart)
