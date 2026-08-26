@@ -43,15 +43,10 @@ func (s *Signer) buildIncrement(buf []byte, pi *pdfInfo, srcSize int64, reason, 
 	}
 
 	// Tagged (accessible) documents need /DisplayDocTitle plus /Tabs /S on the
-	// page that receives the signature widget. See accessibility.go.
-	addDisplayDocTitle := pi.tagged
-	inlineViewerPrefs := addDisplayDocTitle && pi.viewerPrefsObjNr == 0
-	// Only rewrite the /ViewerPreferences object when it is a distinct, existing
-	// object; otherwise leave viewer preferences untouched rather than risk
-	// emitting a duplicate or colliding object.
-	updateViewerPrefsObj := addDisplayDocTitle && pi.viewerPrefsObjNr > 0 &&
-		pi.viewerPrefsObjNr != pi.catalogObjNr && pi.viewerPrefsObjNr != pi.pageObjNr &&
-		pi.viewerPrefsObjNr < pi.nextObjNr
+	// page that receives the signature widget. parsePDF has already classified
+	// /ViewerPreferences (see resolveViewerPrefs): -1 means leave untouched.
+	inlineViewerPrefs := pi.tagged && pi.viewerPrefsObjNr == 0
+	updateViewerPrefsObj := pi.tagged && pi.viewerPrefsObjNr > 0
 	addTabs := pi.tagged && !pi.pageHasTabs
 
 	buf = buf[:0]
@@ -188,7 +183,7 @@ func (s *Signer) buildIncrement(buf []byte, pi *pdfInfo, srcSize int64, reason, 
 		buf = appendDictWithoutKey(buf, pi.catalogRaw, kwSlashAcroForm)
 	}
 	buf = append(buf, "\n/AcroForm << /Fields ["...)
-	if pi.existingFields != nil && len(pi.existingFields) > 0 {
+	if len(pi.existingFields) > 0 {
 		buf = append(buf, ' ')
 		buf = append(buf, pi.existingFields...)
 	}
@@ -222,7 +217,7 @@ func (s *Signer) buildIncrement(buf []byte, pi *pdfInfo, srcSize int64, reason, 
 	// /Tabs are preserved verbatim.
 	buf = appendDictWithoutKey(buf, pi.pageRaw, kwSlashAnnots)
 	buf = append(buf, "\n/Annots ["...)
-	if pi.existingAnnots != nil && len(pi.existingAnnots) > 0 {
+	if len(pi.existingAnnots) > 0 {
 		buf = append(buf, ' ')
 		buf = append(buf, pi.existingAnnots...)
 	}
@@ -270,7 +265,7 @@ func (s *Signer) buildIncrement(buf []byte, pi *pdfInfo, srcSize int64, reason, 
 		buf = appendInt(buf, pi.infoObjNr)
 		buf = append(buf, " 0 R\n"...)
 	}
-	if pi.idArray != nil && len(pi.idArray) > 0 {
+	if len(pi.idArray) > 0 {
 		buf = append(buf, "/ID "...)
 		buf = append(buf, pi.idArray...)
 		buf = append(buf, '\n')
@@ -311,20 +306,16 @@ func appendDictWithoutKeys2(buf []byte, raw []byte, keyA, keyB []byte) []byte {
 		return appendDictWithoutKey(buf, raw, keyA)
 	}
 
-	// Order the two removal ranges.
+	// Order the two removal ranges. Top-level key ranges never overlap
+	// (findValueEnd stops before the next top-level key), so after ordering
+	// startB >= endA always holds.
 	if startB < startA {
 		startA, endA, startB, endB = startB, endB, startA, endA
 	}
 
 	buf = append(buf, raw[:startA]...)
-	if startB > endA {
-		buf = append(buf, raw[endA:startB]...)
-	}
-	if endB > endA {
-		buf = append(buf, raw[endB:]...)
-	} else {
-		buf = append(buf, raw[endA:]...)
-	}
+	buf = append(buf, raw[endA:startB]...)
+	buf = append(buf, raw[endB:]...)
 	return buf
 }
 

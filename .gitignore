@@ -1,6 +1,7 @@
 # Build artifacts
 flashsign
 *.bin
+coverage.out
 
 # Config with credentials
 config.ini

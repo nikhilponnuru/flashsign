@@ -219,14 +219,14 @@ func (s *Signer) buildCMSSignature(contentHash []byte, signingTime time.Time) ([
 	// Pre-compute all DER sizes bottom-up.
 
 	// messageDigest attribute: SEQUENCE { OID, SET { OCTET STRING(hash) } }
-	mdValueLen := derTLVLen(hashLen)             // OCTET STRING
-	mdSetLen := derTLVLen(mdValueLen)            // SET { ... }
+	mdValueLen := derTLVLen(hashLen)  // OCTET STRING
+	mdSetLen := derTLVLen(mdValueLen) // SET { ... }
 	mdAttrContentLen := len(derOIDMsgDigest) + mdSetLen
 	mdAttrLen := derTLVLen(mdAttrContentLen) // SEQUENCE
 
 	// signingTime attribute: SEQUENCE { OID, SET { UTCTime } }
-	const utcTimeLen = 15                           // tag(1) + len(1) + 13 chars
-	stSetLen := derTLVLen(utcTimeLen)               // SET { UTCTime }
+	const utcTimeLen = 15             // tag(1) + len(1) + 13 chars
+	stSetLen := derTLVLen(utcTimeLen) // SET { UTCTime }
 	stAttrContentLen := len(derOIDSigningTime) + stSetLen
 	stAttrLen := derTLVLen(stAttrContentLen) // SEQUENCE
 

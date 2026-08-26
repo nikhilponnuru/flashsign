@@ -45,7 +45,9 @@ const signatureFieldDescription = "Digital signature"
 // A /StructTreeRoot entry, or /MarkInfo with /Marked true, marks the document
 // as tagged.
 func isTaggedCatalog(data []byte, xref map[int]xrefEntry, catalogRaw []byte) bool {
-	if extractDictValue(catalogRaw, "StructTreeRoot") != nil {
+	// A /StructTreeRoot left as null (eg by an editor that stripped the
+	// structure tree) does not make the document tagged.
+	if v := extractDictValue(catalogRaw, "StructTreeRoot"); v != nil && !isPDFNull(v) {
 		return true
 	}
 
@@ -62,9 +64,14 @@ func isTaggedCatalog(data []byte, xref map[int]xrefEntry, catalogRaw []byte) boo
 	return isPDFTrue(extractDictValue(markInfoDict, "Marked"))
 }
 
-// resolveViewerPrefs returns the /ViewerPreferences object number (0 when the
-// value is a direct dict or missing) and its raw dict content (nil when absent
-// or unresolvable).
+// resolveViewerPrefs classifies the catalog's /ViewerPreferences entry:
+//
+//	( 0, nil) absent — a fresh inline dict can be added
+//	( 0, raw) direct dict, or an indirect ref that resolved but cannot be
+//	          rewritten in place — the content is merged inline
+//	( n, raw) generation-0 indirect ref to object n — rewritten in place
+//	(-1, nil) ref present but unresolvable — the catalog entry must be left
+//	          untouched rather than risk destroying preferences
 func resolveViewerPrefs(data []byte, xref map[int]xrefEntry, catalogRaw []byte) (int, []byte) {
 	val := extractDictValue(catalogRaw, "ViewerPreferences")
 	if val == nil {
@@ -72,13 +79,19 @@ func resolveViewerPrefs(data []byte, xref map[int]xrefEntry, catalogRaw []byte) 
 	}
 
 	if isIndirectRef(val) {
-		objNr, _, err := extractIndirectRef(val)
+		objNr, gen, err := extractIndirectRef(val)
 		if err != nil {
-			return 0, nil
+			return -1, nil
 		}
 		raw, err := resolveObjectDict(data, xref, objNr)
 		if err != nil {
-			return 0, nil
+			return -1, nil
+		}
+		if gen != 0 {
+			// The increment writer emits "n 0 obj" and a generation-0 xref
+			// entry, which would shadow the object without satisfying the
+			// catalog's gen-g reference; merge the content inline instead.
+			return 0, raw
 		}
 		return objNr, raw
 	}
@@ -106,4 +119,9 @@ func resolveDictOrRef(data []byte, xref map[int]xrefEntry, val []byte) []byte {
 // isPDFTrue reports whether a raw PDF value is the boolean true.
 func isPDFTrue(val []byte) bool {
 	return bytes.HasPrefix(bytes.TrimLeft(val, " \t\r\n"), []byte("true"))
+}
+
+// isPDFNull reports whether a raw PDF value is the null object.
+func isPDFNull(val []byte) bool {
+	return bytes.HasPrefix(bytes.TrimLeft(val, " \t\r\n"), []byte("null"))
 }

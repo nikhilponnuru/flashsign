@@ -1,5 +1,9 @@
 # flashsign
 
+[![CI](https://github.com/nikhilponnuru/flashsign/actions/workflows/ci.yml/badge.svg)](https://github.com/nikhilponnuru/flashsign/actions/workflows/ci.yml)
+[![Go Reference](https://pkg.go.dev/badge/github.com/nikhilponnuru/flashsign.svg)](https://pkg.go.dev/github.com/nikhilponnuru/flashsign)
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+
 High-performance PDF digital signing library and CLI in Go. Drop-in replacement for [jpdfsigner](https://github.com/zerodha/jpdfsigner) — rewritten in Go with near-zero allocations.
 
 ## Features
@@ -17,7 +21,13 @@ High-performance PDF digital signing library and CLI in Go. Drop-in replacement 
 - Streaming and in-memory signing APIs
 - Production-hardened HTTP server (graceful shutdown, concurrency limiter, health endpoint)
 
-## Build
+## Install
+
+```bash
+go install github.com/nikhilponnuru/flashsign/cmd/flashsign@latest
+```
+
+Or build from a checkout:
 
 ```bash
 go build -o flashsign ./cmd/flashsign/
@@ -225,7 +235,7 @@ Compatibility mode (no-args startup):
 flashsign is also a Go library:
 
 ```go
-import "flashsign"
+import "github.com/nikhilponnuru/flashsign"
 ```
 
 ### Sign in memory (fastest)

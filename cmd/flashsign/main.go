@@ -25,7 +25,7 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/iamd3vil/flashsign"
+	"github.com/nikhilponnuru/flashsign"
 )
 
 const usage = `flashsign — high-performance PDF signing

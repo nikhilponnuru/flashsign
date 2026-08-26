@@ -65,6 +65,9 @@ type testPDFOpts struct {
 	// viewerPrefsIndirect, when non-empty, emits /ViewerPreferences as an
 	// indirect reference to an object holding this dict content.
 	viewerPrefsIndirect string
+	// structTreeNull writes /StructTreeRoot null (a stripped structure tree),
+	// which must NOT count as tagged.
+	structTreeNull bool
 }
 
 // Object layout of the generated fixture:
@@ -82,6 +85,9 @@ func buildTestPDF(t *testing.T, opts testPDFOpts) []byte {
 		if !opts.markedOnly {
 			catalog += " /StructTreeRoot 7 0 R"
 		}
+	}
+	if opts.structTreeNull {
+		catalog += " /StructTreeRoot null"
 	}
 	switch {
 	case opts.viewerPrefsIndirect != "":
@@ -543,6 +549,92 @@ func TestSignRealAccessibleContractNote(t *testing.T) {
 	mustContain(t, incr, "/TU (Digital signature)", "signature widget")
 	mustContain(t, incr, "/Rect [0 550 278 609]", "signature widget")
 
+	validateWithPDFCPU(t, out)
+}
+
+// --- degenerate /ViewerPreferences and /StructTreeRoot cases ----------------
+
+// setViewerPrefsGen rewrites the fixture so /ViewerPreferences references
+// object 9 at a non-zero generation (same-length patches, offsets unchanged).
+func setViewerPrefsGen(t *testing.T, pdf []byte, gen int) []byte {
+	t.Helper()
+	out := bytes.Replace(pdf, []byte("/ViewerPreferences 9 0 R"), []byte(fmt.Sprintf("/ViewerPreferences 9 %d R", gen)), 1)
+	out = bytes.Replace(out, []byte("\n9 0 obj"), []byte(fmt.Sprintf("\n9 %d obj", gen)), 1)
+	hdr := []byte("xref\n0 11\n")
+	i := bytes.LastIndex(out, hdr)
+	if i < 0 {
+		t.Fatal("xref header not found in fixture")
+	}
+	// Entry line for object 9: 20 bytes each, line 0 is the free entry.
+	genPos := i + len(hdr) + 20*9 + 11
+	copy(out[genPos:genPos+5], fmt.Sprintf("%05d", gen))
+	if bytes.Equal(out, pdf) {
+		t.Fatal("generation patch did not change the fixture")
+	}
+	return out
+}
+
+func TestSignTaggedPDFNonzeroGenViewerPrefsMergesInline(t *testing.T) {
+	signer := newGeneratedSigner(t)
+	in := setViewerPrefsGen(t, buildTestPDF(t, testPDFOpts{
+		tagged:              true,
+		viewerPrefsIndirect: "<< /Direction /R2L >>",
+	}), 2)
+
+	out, err := signer.SignBytes(in, SignParams{})
+	if err != nil {
+		t.Fatalf("SignBytes: %v", err)
+	}
+	incr := increment(t, in, out)
+
+	// The gen-2 object must not be shadowed by a gen-0 rewrite; instead the
+	// resolved preferences are merged inline into the catalog.
+	mustNotContain(t, incr, "9 0 obj", "increment")
+	mustNotContain(t, incr, "9 2 R", "rewritten catalog")
+	mustContain(t, incr, "/ViewerPreferences << /Direction /R2L /DisplayDocTitle true >>", "catalog")
+	mustCount(t, incr, "/DisplayDocTitle", 1, "catalog")
+	validateWithPDFCPU(t, out)
+}
+
+func TestSignTaggedPDFUnresolvableViewerPrefsLeftUntouched(t *testing.T) {
+	signer := newGeneratedSigner(t)
+	in := bytes.Replace(
+		buildTestPDF(t, testPDFOpts{tagged: true, viewerPrefsIndirect: "<< /Direction /R2L >>"}),
+		[]byte("/ViewerPreferences 9 0 R"), []byte("/ViewerPreferences 99 0 R"), 1)
+	// Same-length patch: drop a trailing space before >> to keep offsets stable.
+	in = bytes.Replace(in, []byte("99 0 R >>"), []byte("99 0 R>>"), 1)
+	if len(in) != len(buildTestPDF(t, testPDFOpts{tagged: true, viewerPrefsIndirect: "<< /Direction /R2L >>"})) {
+		t.Fatal("unresolvable-ref patch changed fixture length")
+	}
+
+	out, err := signer.SignBytes(in, SignParams{})
+	if err != nil {
+		t.Fatalf("SignBytes: %v", err)
+	}
+	incr := increment(t, in, out)
+
+	// The dangling reference is preserved verbatim; no DisplayDocTitle is
+	// invented, but the page-level accessibility entries still apply.
+	mustContain(t, incr, "/ViewerPreferences 99 0 R", "catalog")
+	mustNotContain(t, incr, "/DisplayDocTitle", "catalog")
+	mustContain(t, incr, "/Tabs /S", "signature page")
+	mustContain(t, incr, "/TU (Digital signature)", "signature widget")
+}
+
+func TestSignStructTreeRootNullIsUntagged(t *testing.T) {
+	signer := newGeneratedSigner(t)
+	in := buildTestPDF(t, testPDFOpts{structTreeNull: true})
+
+	out, err := signer.SignBytes(in, SignParams{})
+	if err != nil {
+		t.Fatalf("SignBytes: %v", err)
+	}
+	incr := increment(t, in, out)
+
+	mustNotContain(t, incr, "/DisplayDocTitle", "catalog")
+	mustNotContain(t, incr, "/Tabs", "signature page")
+	mustNotContain(t, incr, "/TU (", "signature widget")
+	mustContain(t, incr, "adbe.pkcs7.detached", "signature dict")
 	validateWithPDFCPU(t, out)
 }
 

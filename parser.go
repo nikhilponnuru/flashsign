@@ -25,7 +25,7 @@ type pdfInfo struct {
 
 	// Accessibility (tagged PDF) related state.
 	tagged           bool   // /StructTreeRoot present or /MarkInfo << /Marked true >>
-	viewerPrefsObjNr int    // object number when /ViewerPreferences is an indirect ref, else 0
+	viewerPrefsObjNr int    // gen-0 indirect /ViewerPreferences object to rewrite; 0 = inline/absent; -1 = leave untouched
 	viewerPrefsRaw   []byte // raw /ViewerPreferences dict content, or nil when absent
 	pageHasTabs      bool   // target page already has a top-level /Tabs entry
 }
@@ -130,7 +130,24 @@ func parsePDF(data []byte, targetPage int) (pdfInfo, error) {
 	}
 
 	// Accessibility state: tagged documents need /DisplayDocTitle and /Tabs /S.
-	vpObjNr, vpRaw := resolveViewerPrefs(data, xref, catalogRaw)
+	// Untagged documents skip the extra catalog/page scans entirely.
+	tagged := isTaggedCatalog(data, xref, catalogRaw)
+	var vpObjNr int
+	var vpRaw []byte
+	pageHasTabs := false
+	if tagged {
+		vpObjNr, vpRaw = resolveViewerPrefs(data, xref, catalogRaw)
+		if vpObjNr > 0 && (vpObjNr == trailer.rootObjNr || vpObjNr == pageObjNr) {
+			// Degenerate self-reference; leave viewer preferences untouched.
+			vpObjNr, vpRaw = -1, nil
+		} else if vpObjNr >= trailer.size {
+			// Object exists but lies beyond the trailer /Size (understated in
+			// sloppy real-world files); merge inline instead of emitting an
+			// object number the increment reserves for new objects.
+			vpObjNr = 0
+		}
+		pageHasTabs = findTopLevelKey(pageRaw, kwSlashTabs) >= 0
+	}
 
 	return pdfInfo{
 		nextObjNr:      trailer.size,
@@ -145,10 +162,10 @@ func parsePDF(data []byte, targetPage int) (pdfInfo, error) {
 		infoGen:        trailer.infoGen,
 		idArray:        trailer.idArray,
 
-		tagged:           isTaggedCatalog(data, xref, catalogRaw),
+		tagged:           tagged,
 		viewerPrefsObjNr: vpObjNr,
 		viewerPrefsRaw:   vpRaw,
-		pageHasTabs:      findTopLevelKey(pageRaw, kwSlashTabs) >= 0,
+		pageHasTabs:      pageHasTabs,
 	}, nil
 }
 

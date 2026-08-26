@@ -1,4 +1,4 @@
-module github.com/iamd3vil/flashsign
+module github.com/nikhilponnuru/flashsign
 
 go 1.25.0
 
