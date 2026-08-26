@@ -7,6 +7,7 @@ High-performance PDF digital signing library and CLI in Go. Drop-in replacement 
 - PKCS#7 detached signatures (SHA-256 + RSA / ECDSA P-256/P-384)
 - Visible and invisible signatures
 - Sign + AES-128/256 encryption
+- Accessibility-preserving: tagged (PDF/UA style) documents keep their structure and stay screen-reader readable ([details](#accessibility-tagged-pdfs))
 - PFX (PKCS#12) and PEM certificate loading
 - `config.ini` support for easy deployment
 - Custom PDF parser — no pdfcpu in the signing hot path
@@ -300,6 +301,39 @@ for _, item := range items {
     // item.Result contains signed PDF bytes
 }
 ```
+
+## Accessibility (tagged PDFs)
+
+Signing must not degrade an accessible document. When the source PDF is tagged
+(it has `/StructTreeRoot`, or `/MarkInfo << /Marked true >>`), flashsign:
+
+- **Preserves** `/StructTreeRoot`, `/MarkInfo`, `/Lang`, `/Metadata` (XMP), `/Outlines`,
+  the `/Info` dictionary, `/ID`, existing `/ViewerPreferences` entries (eg `/Direction`),
+  and per-page `/StructParents`, existing `/Tabs` and existing `/Annots`.
+  The catalog and page dictionaries are copied byte-for-byte apart from the keys
+  that must change.
+- **Adds** `/ViewerPreferences << /DisplayDocTitle true >>` so assistive technology
+  announces the document title instead of the file name (PDF/UA-1 7.1). Existing
+  viewer preferences are merged; an explicit `/DisplayDocTitle false` is corrected
+  to `true`. When `/ViewerPreferences` is an indirect reference, that object is
+  updated in the increment instead of the catalog.
+- **Adds** `/Tabs /S` to the page that receives the signature widget, so annotation
+  tab order follows the structure tree (PDF/UA-1 7.18.3). This applies to invisible
+  signatures too, since they also add a widget annotation. Pages that already
+  declare `/Tabs` are left untouched.
+- **Adds** `/TU (Digital signature)` to the signature widget as its alternate
+  description (PDF/UA-1 7.18.6.2).
+- **Permits screen readers** when `password`/`SignAndEncrypt` encryption is used:
+  the encryption permissions are printing *plus* "extract text and graphics for
+  accessibility" (PDF 32000-1 Table 22 bit 10, `/P = -1337`). Copying for other
+  purposes, modification and assembly remain disallowed.
+
+Untagged PDFs are signed exactly as before — none of the entries above are added.
+
+The signature widget deliberately gets **no** `/StructParent`: referencing the
+structure tree would require also extending `/StructTreeRoot /K`, the `/ParentTree`
+number tree and `/ParentTreeNextKey`, and a dangling `/StructParent` is worse than
+none. Full structure-tree integration of the widget is intentionally out of scope.
 
 ## Performance
 
