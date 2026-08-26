@@ -31,7 +31,7 @@ func newGeneratedSigner(t *testing.T) *Signer {
 
 	tmpl := &x509.Certificate{
 		SerialNumber:          big.NewInt(20260729),
-		Subject:               pkix.Name{CommonName: "FlashSign Test Signer", Organization: []string{"Zerodha"}},
+		Subject:               pkix.Name{CommonName: "FlashSign Test Signer", Organization: []string{"FlashSign Test"}},
 		NotBefore:             time.Now().Add(-time.Hour),
 		NotAfter:              time.Now().Add(24 * time.Hour),
 		KeyUsage:              x509.KeyUsageDigitalSignature | x509.KeyUsageContentCommitment,
@@ -106,11 +106,11 @@ func buildTestPDF(t *testing.T, opts testPDFOpts) []byte {
 		"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 595 842] /StructParents 0 /Resources << >> /Contents 5 0 R >>",
 		"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 595 842] /StructParents 1 /Tabs /S /Resources << >> /Contents 5 0 R /Annots [6 0 R] >>",
 		fmt.Sprintf("<< /Length %d >>\nstream\n%sendstream", len(content), content),
-		"<< /Type /Annot /Subtype /Link /Rect [20 20 120 40] /Border [0 0 0] /StructParent 2 /A << /Type /Action /S /URI /URI (https://zerodha.com) >> >>",
+		"<< /Type /Annot /Subtype /Link /Rect [20 20 120 40] /Border [0 0 0] /StructParent 2 /A << /Type /Action /S /URI /URI (https://example.com) >> >>",
 		"<< /Type /StructTreeRoot >>",
 		metadataStreamObj(),
 		"<< >>", // placeholder, replaced below when viewer prefs are indirect
-		"<< /Title (Contract Note) /Author (Zerodha Broking Limited) >>",
+		"<< /Title (Sample Document) /Author (Example Corp) >>",
 	}
 	if opts.viewerPrefsIndirect != "" {
 		objs[8] = opts.viewerPrefsIndirect
@@ -120,7 +120,7 @@ func buildTestPDF(t *testing.T, opts testPDFOpts) []byte {
 }
 
 func metadataStreamObj() string {
-	const xmp = `<?xpacket begin="" id="W5M0MpCehiHzreSzNTczkc9d"?><x:xmpmeta xmlns:x="adobe:ns:meta/"><rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#"><rdf:Description rdf:about="" xmlns:dc="http://purl.org/dc/elements/1.1/"><dc:title><rdf:Alt><rdf:li xml:lang="x-default">Contract Note</rdf:li></rdf:Alt></dc:title></rdf:Description></rdf:RDF></x:xmpmeta><?xpacket end="r"?>`
+	const xmp = `<?xpacket begin="" id="W5M0MpCehiHzreSzNTczkc9d"?><x:xmpmeta xmlns:x="adobe:ns:meta/"><rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#"><rdf:Description rdf:about="" xmlns:dc="http://purl.org/dc/elements/1.1/"><dc:title><rdf:Alt><rdf:li xml:lang="x-default">Sample Document</rdf:li></rdf:Alt></dc:title></rdf:Description></rdf:RDF></x:xmpmeta><?xpacket end="r"?>`
 	return fmt.Sprintf("<< /Type /Metadata /Subtype /XML /Length %d >>\nstream\n%s\nendstream", len(xmp), xmp)
 }
 
@@ -386,8 +386,8 @@ func TestSignVisibleOnTaggedPDF(t *testing.T) {
 		Visible:  &visible,
 		Rect:     &rect,
 		Reason:   "Regulatory",
-		Contact:  "Zerodha Broking Limited",
-		Location: "Zerodha Broking Limited, Bangalore",
+		Contact:  "Example Corp",
+		Location: "Example Corp, Head Office",
 	})
 	if err != nil {
 		t.Fatalf("SignBytes: %v", err)
@@ -512,13 +512,13 @@ func TestSignAndEncryptTaggedPDFStaysAccessible(t *testing.T) {
 	}
 }
 
-// --- real contract-note fixture (optional) --------------------------------
+// --- real tagged-document fixture (optional) ------------------------------
 
-// TestSignRealAccessibleContractNote exercises a real tagged Typst contract
-// note when present. testdata/ is gitignored, so the test skips when the
+// TestSignRealAccessibleTaggedPDF exercises a real, externally produced tagged
+// PDF when one is present. testdata/ is gitignored, so the test skips when the
 // fixture is unavailable rather than reporting a code failure.
-func TestSignRealAccessibleContractNote(t *testing.T) {
-	const fixture = "testdata/accessible-contract-note.pdf"
+func TestSignRealAccessibleTaggedPDF(t *testing.T) {
+	const fixture = "testdata/accessible-tagged.pdf"
 	in, err := os.ReadFile(fixture)
 	if err != nil {
 		t.Skipf("fixture %s not available: %v", fixture, err)
@@ -532,8 +532,8 @@ func TestSignRealAccessibleContractNote(t *testing.T) {
 		Visible:  &visible,
 		Rect:     &rect,
 		Reason:   "Regulatory",
-		Contact:  "Zerodha Broking Limited",
-		Location: "Zerodha Broking Limited, Bangalore",
+		Contact:  "Example Corp",
+		Location: "Example Corp, Head Office",
 	})
 	if err != nil {
 		t.Fatalf("SignBytes: %v", err)

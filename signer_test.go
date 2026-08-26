@@ -76,7 +76,7 @@ func TestSignVisibleWithReversedRect(t *testing.T) {
 	}
 
 	visible := true
-	// Same coordinate style as jpdfsigner config: y1 > y2.
+	// Inverted coordinate style some signers emit: y1 > y2.
 	rect := Rectangle{X1: 0, Y1: 609, X2: 278, Y2: 550}
 	outPath := filepath.Join(t.TempDir(), "signed-visible-reversed-rect.pdf")
 
@@ -111,16 +111,16 @@ func TestSignXRefStreamSourceCompat(t *testing.T) {
 	}
 
 	visible := true
-	// Same values as contract-note config; normalization should handle y1 > y2.
+	// Typical production config values; normalization should handle y1 > y2.
 	rect := Rectangle{X1: 0, Y1: 609, X2: 278, Y2: 550}
-	outPath := filepath.Join(t.TempDir(), "mcx-SUN844.signed.pdf")
+	outPath := filepath.Join(t.TempDir(), "xrefstream-sample.signed.pdf")
 
 	err = signer.Sign(SignParams{
-		Src:      filepath.Join("testdata", "mcx-SUN844.pdf"),
+		Src:      filepath.Join("testdata", "xrefstream-sample.pdf"),
 		Dest:     outPath,
 		Reason:   "Regulatory",
-		Contact:  "Zerodha Broking Limited",
-		Location: "Zerodha Broking Limited, Bangalore",
+		Contact:  "Example Corp",
+		Location: "Example Corp, Head Office",
 		Visible:  &visible,
 		Rect:     &rect,
 	})

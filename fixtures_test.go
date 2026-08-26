@@ -28,7 +28,7 @@ import (
 // ones as self-signed stand-ins. Files that already exist are never
 // overwritten, which keeps a working copy holding the real fixtures on those.
 //
-// testdata/Zerodha.pfx is the one exception: it is a real certificate and
+// testdata/signing.pfx is the one exception: it is a real certificate and
 // cannot be synthesised, so the tests that need it skip when it is absent.
 const (
 	testDataDir     = "testdata"
@@ -183,8 +183,8 @@ func ensurePDFFixtures() error {
 	}
 
 	// A PDF whose catalog and pages live in object streams behind an xref
-	// stream, standing in for the real mcx-SUN844.pdf contract note.
-	return writeIfMissing("mcx-SUN844.pdf", func() ([]byte, error) {
+	// stream, exercising the pdfcpu compatibility rewrite path.
+	return writeIfMissing("xrefstream-sample.pdf", func() ([]byte, error) {
 		conf := model.NewDefaultConfiguration()
 		conf.ValidationMode = model.ValidationRelaxed
 		conf.ValidateLinks = false

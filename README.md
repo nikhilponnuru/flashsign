@@ -4,7 +4,7 @@
 [![Go Reference](https://pkg.go.dev/badge/github.com/nikhilponnuru/flashsign.svg)](https://pkg.go.dev/github.com/nikhilponnuru/flashsign)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 
-High-performance PDF digital signing library and CLI in Go. Drop-in replacement for [jpdfsigner](https://github.com/zerodha/jpdfsigner) — rewritten in Go with near-zero allocations.
+High-performance PDF digital signing library and CLI in Go, built as a drop-in replacement for Java-based PDF signing services — with near-zero allocations on the signing path.
 
 ## Features
 
@@ -41,13 +41,13 @@ Create a `config.ini` with your signing settings:
 
 ```ini
 # Certificate
-keyfile=Zerodha.pfx
+keyfile=signing.pfx
 password=yourpassword
 
 # Signature metadata
 reason=Regulatory
-contact=Zerodha Broking Limited
-location=Zerodha Broking Limited, Bangalore
+contact=Example Corp
+location=Example Corp, Head Office
 
 # Visible signature coordinates (PDF coordinate system: 0,0 at bottom-left)
 page=1
@@ -66,7 +66,7 @@ Then sign with:
 Start HTTP signer server (`/sign` endpoint + `/health`):
 
 ```bash
-./flashsign serve -config config.ini -pfx ./testdata/Zerodha.pfx
+./flashsign serve -config config.ini -pfx ./testdata/signing.pfx
 ```
 
 The server provides:
@@ -94,7 +94,7 @@ The server provides:
 Sign and encrypt:
 
 ```bash
-./flashsign encrypt -config config.ini -src input.pdf -dest output.pdf -password "clientPAN123"
+./flashsign encrypt -config config.ini -src input.pdf -dest output.pdf -password "recipient-password"
 ```
 
 Signing vs password locking:
@@ -112,7 +112,7 @@ Flags override config values, so you can use the config for defaults and overrid
 
 ```bash
 ./flashsign sign \
-  -pfx Zerodha.pfx \
+  -pfx signing.pfx \
   -pfx-pass 'yourpassword' \
   -src input.pdf \
   -dest output.pdf \
@@ -120,15 +120,15 @@ Flags override config values, so you can use the config for defaults and overrid
   -page 1 \
   -x1 0 -y1 609 -x2 278 -y2 550 \
   -reason "Regulatory" \
-  -contact "Zerodha Broking Limited" \
-  -location "Zerodha Broking Limited, Bangalore"
+  -contact "Example Corp" \
+  -location "Example Corp, Head Office"
 ```
 
 ### Sign and encrypt (flags)
 
 ```bash
 ./flashsign encrypt \
-  -pfx Zerodha.pfx \
+  -pfx signing.pfx \
   -pfx-pass 'yourpassword' \
   -src input.pdf \
   -dest output.pdf \
@@ -136,9 +136,9 @@ Flags override config values, so you can use the config for defaults and overrid
   -page 1 \
   -x1 0 -y1 609 -x2 278 -y2 550 \
   -reason "Regulatory" \
-  -contact "Zerodha Broking Limited" \
-  -location "Zerodha Broking Limited, Bangalore" \
-  -password "clientPAN123"
+  -contact "Example Corp" \
+  -location "Example Corp, Head Office" \
+  -password "recipient-password"
 ```
 
 Encryption uses AES-128 by default. Add `-aes256` for AES-256.
@@ -241,7 +241,7 @@ import "github.com/nikhilponnuru/flashsign"
 ### Sign in memory (fastest)
 
 ```go
-signer, err := flashsign.NewSignerFromPFX("Zerodha.pfx", "password")
+signer, err := flashsign.NewSignerFromPFX("signing.pfx", "password")
 if err != nil {
     log.Fatal(err)
 }
@@ -252,8 +252,8 @@ visible := true
 rect := flashsign.Rectangle{X1: 0, Y1: 550, X2: 278, Y2: 609}
 signed, err := signer.SignBytes(pdfData, flashsign.SignParams{
     Reason:   "Regulatory",
-    Contact:  "Zerodha Broking Limited",
-    Location: "Zerodha Broking Limited, Bangalore",
+    Contact:  "Example Corp",
+    Location: "Example Corp, Head Office",
     Page:     1,
     Visible:  &visible,
     Rect:     &rect,
@@ -291,7 +291,7 @@ err := signer.Sign(flashsign.SignParams{
 ```go
 err := signer.SignAndEncrypt(
     flashsign.SignParams{Src: "input.pdf", Dest: "output.pdf"},
-    flashsign.EncryptParams{Password: "clientPAN123"},
+    flashsign.EncryptParams{Password: "recipient-password"},
 )
 ```
 
@@ -395,9 +395,11 @@ Run race detector:
 go test -race ./...
 ```
 
-### 2) CLI smoke test (contract-note style PDF)
+### 2) CLI smoke test
 
-This example assumes `./testdata/Zerodha.pfx` and `./testdata/mcx-SUN844.pdf` are available.
+This example assumes `./testdata/signing.pfx` and `./testdata/xrefstream-sample.pdf` are available. The
+test suite generates `xrefstream-sample.pdf` for you on its first run; supply your own
+certificate as `signing.pfx`.
 
 Build binary:
 
@@ -410,32 +412,32 @@ Sign a sample PDF using config defaults (override only what changes per run):
 ```bash
 ./flashsign sign \
   -config ./config.ini \
-  -pfx ./testdata/Zerodha.pfx \
-  -src ./testdata/mcx-SUN844.pdf \
-  -dest /tmp/mcx-SUN844.signed.pdf
+  -pfx ./testdata/signing.pfx \
+  -src ./testdata/xrefstream-sample.pdf \
+  -dest /tmp/xrefstream-sample.signed.pdf
 ```
 
 Sanity-check signature markers:
 
 ```bash
-rg -a -n "ByteRange|adbe\\.pkcs7\\.detached|/Reason|/Location" /tmp/mcx-SUN844.signed.pdf
+rg -a -n "ByteRange|adbe\\.pkcs7\\.detached|/Reason|/Location" /tmp/xrefstream-sample.signed.pdf
 ```
 
 Verify output size increased:
 
 ```bash
-wc -c ./testdata/mcx-SUN844.pdf /tmp/mcx-SUN844.signed.pdf
+wc -c ./testdata/xrefstream-sample.pdf /tmp/xrefstream-sample.signed.pdf
 ```
 
 Optional in-place write check (`-src == -dest`):
 
 ```bash
-cp ./testdata/mcx-SUN844.pdf /tmp/mcx-SUN844.inplace.pdf
+cp ./testdata/xrefstream-sample.pdf /tmp/xrefstream-sample.inplace.pdf
 ./flashsign sign \
   -config ./config.ini \
-  -pfx ./testdata/Zerodha.pfx \
-  -src /tmp/mcx-SUN844.inplace.pdf \
-  -dest /tmp/mcx-SUN844.inplace.pdf
+  -pfx ./testdata/signing.pfx \
+  -src /tmp/xrefstream-sample.inplace.pdf \
+  -dest /tmp/xrefstream-sample.inplace.pdf
 ```
 
 ### 3) HTTP server smoke test
@@ -443,7 +445,7 @@ cp ./testdata/mcx-SUN844.pdf /tmp/mcx-SUN844.inplace.pdf
 Start server:
 
 ```bash
-./flashsign serve -config ./config.ini -pfx ./testdata/Zerodha.pfx -host 127.0.0.1 -port 18090
+./flashsign serve -config ./config.ini -pfx ./testdata/signing.pfx -host 127.0.0.1 -port 18090
 ```
 
 Send request:
@@ -452,16 +454,16 @@ Send request:
 curl -sS -X POST http://127.0.0.1:18090/sign \
   -H 'Content-Type: application/json' \
   -d '{
-    "input_file":"./testdata/mcx-SUN844.pdf",
-    "output_file":"/tmp/mcx-SUN844.http.signed.pdf",
-    "password":"clientPAN123"
+    "input_file":"./testdata/xrefstream-sample.pdf",
+    "output_file":"/tmp/xrefstream-sample.http.signed.pdf",
+    "password":"recipient-password"
   }'
 ```
 
 Check signature markers:
 
 ```bash
-rg -a -n "ByteRange|adbe\\.pkcs7\\.detached|/Rect|/BBox" /tmp/mcx-SUN844.http.signed.pdf
+rg -a -n "ByteRange|adbe\\.pkcs7\\.detached|/Rect|/BBox" /tmp/xrefstream-sample.http.signed.pdf
 ```
 
 ### 4) Benchmarking

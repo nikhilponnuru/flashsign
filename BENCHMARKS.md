@@ -1,5 +1,8 @@
 # flashsign vs gopdfsigner — Benchmark Comparison
 
+Comparison against [gopdfsigner](https://github.com/iamd3vil/gopdfsigner), another
+Go PDF signing library.
+
 ## Environment
 
 | | |

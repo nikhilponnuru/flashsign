@@ -33,7 +33,7 @@ const usage = `flashsign — high-performance PDF signing
 Usage:
   flashsign sign    [flags]   Sign a PDF
   flashsign encrypt [flags]   Sign and encrypt a PDF
-  flashsign serve   [flags]   Start HTTP signer server compatible with jpdfsigner
+  flashsign serve   [flags]   Start HTTP signer server
 
 Common flags:
   -config string     Path to config.ini (optional, flags override config values)
@@ -450,7 +450,7 @@ func normalizeRect(rect flashsign.Rectangle) flashsign.Rectangle {
 	return rect
 }
 
-// maybeRunCompatServerFromDefaultConfig preserves jpdfsigner's startup behavior:
+// maybeRunCompatServerFromDefaultConfig preserves the legacy Java signer's startup behavior:
 // if config.ini exists and has server=true, start the HTTP server with no args.
 func maybeRunCompatServerFromDefaultConfig() (bool, error) {
 	const cfgPath = "config.ini"

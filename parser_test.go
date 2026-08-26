@@ -106,7 +106,7 @@ func TestExtractIndirectRef(t *testing.T) {
 }
 
 func TestParsePDFXrefStream(t *testing.T) {
-	data, err := os.ReadFile(filepath.Join("testdata", "mcx-SUN844.pdf"))
+	data, err := os.ReadFile(filepath.Join("testdata", "xrefstream-sample.pdf"))
 	if err != nil {
 		t.Fatalf("read xref stream PDF: %v", err)
 	}

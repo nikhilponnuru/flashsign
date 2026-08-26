@@ -100,9 +100,9 @@ func TestAdaptiveContentsPlaceholder(t *testing.T) {
 //
 //	FLASHSIGN_TEST_PFX_PASSWORD=... go test -run LargePFX ./...
 func TestAdaptiveContentsPlaceholderLargePFX(t *testing.T) {
-	pfxPath := filepath.Join("testdata", "Zerodha.pfx")
+	pfxPath := filepath.Join("testdata", "signing.pfx")
 	if _, err := os.Stat(pfxPath); err != nil {
-		t.Skip("Zerodha.pfx not available")
+		t.Skip("signing.pfx not available")
 	}
 	password := os.Getenv("FLASHSIGN_TEST_PFX_PASSWORD")
 	if password == "" {

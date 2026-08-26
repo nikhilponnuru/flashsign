@@ -63,7 +63,7 @@ importers.
 ### Added
 
 - Initial release: high-performance PDF digital signing library and CLI, a drop-in
-  replacement for [jpdfsigner](https://github.com/zerodha/jpdfsigner).
+  replacement for Java-based PDF signing services.
 - PKCS#7 detached signatures (SHA-256 + RSA / ECDSA P-256/P-384), visible and
   invisible signatures, sign + AES-128/256 encryption, PFX and PEM certificate
   loading, `config.ini` support, HTTP signing server, and a custom near-zero-alloc
