@@ -345,6 +345,27 @@ structure tree would require also extending `/StructTreeRoot /K`, the `/ParentTr
 number tree and `/ParentTreeNextKey`, and a dangling `/StructParent` is worse than
 none. Full structure-tree integration of the widget is intentionally out of scope.
 
+## Testing
+
+```bash
+make test        # go test ./...
+make race        # go test -race ./...
+make cover       # coverage report in the browser
+make help        # all targets
+```
+
+`testdata/` is gitignored because it holds real signing certificates. Any fixture
+the suite needs and cannot find there is generated as a self-signed stand-in on
+the first run, so `make test` works on a fresh clone. Fixtures that already exist
+are never overwritten.
+
+One test needs a production certificate and is skipped unless you supply both the
+file and its password out-of-band:
+
+```bash
+FLASHSIGN_TEST_PFX_PASSWORD=... go test -run LargePFX ./...
+```
+
 ## Performance
 
 Benchmarked on Apple M4 Pro, Go 1.25, RSA-2048 key:

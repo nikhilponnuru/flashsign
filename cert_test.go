@@ -93,13 +93,23 @@ func TestAdaptiveContentsPlaceholder(t *testing.T) {
 	}
 }
 
+// TestAdaptiveContentsPlaceholderLargePFX checks that a real, large certificate
+// chain still fits the signature placeholder. It needs a production PFX, whose
+// password must never live in the repository, so both the file and the
+// FLASHSIGN_TEST_PFX_PASSWORD environment variable are required:
+//
+//	FLASHSIGN_TEST_PFX_PASSWORD=... go test -run LargePFX ./...
 func TestAdaptiveContentsPlaceholderLargePFX(t *testing.T) {
 	pfxPath := filepath.Join("testdata", "Zerodha.pfx")
 	if _, err := os.Stat(pfxPath); err != nil {
 		t.Skip("Zerodha.pfx not available")
 	}
+	password := os.Getenv("FLASHSIGN_TEST_PFX_PASSWORD")
+	if password == "" {
+		t.Skip("FLASHSIGN_TEST_PFX_PASSWORD not set")
+	}
 
-	signer, err := NewSignerFromPFX(pfxPath, "test123")
+	signer, err := NewSignerFromPFX(pfxPath, password)
 	if err != nil {
 		t.Fatalf("NewSignerFromPFX returned error: %v", err)
 	}

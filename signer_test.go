@@ -103,7 +103,9 @@ func TestSignVisibleWithReversedRect(t *testing.T) {
 }
 
 func TestSignXRefStreamSourceCompat(t *testing.T) {
-	signer, err := NewSignerFromPFX(filepath.Join("testdata", "Zerodha.pfx"), "test123")
+	// The xref-stream compatibility rewrite is independent of which key signs,
+	// so this uses the standard test PFX and runs everywhere.
+	signer, err := NewSignerFromPFX(filepath.Join("testdata", "test.pfx"), testPFXPassword)
 	if err != nil {
 		t.Fatalf("create signer: %v", err)
 	}
