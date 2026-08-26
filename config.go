@@ -83,7 +83,6 @@ type Signer struct {
 	certBytesDER  []byte // DER-encoded certificate chain bytes
 	signerNameStr string // human-readable signer name
 	keyType       int    // keyTypeRSA, keyTypeECDSAP256, keyTypeECDSAP384
-	sigMaxLen     int    // max raw signature bytes
 
 	// Pre-computed CMS/DER fragments for zero-marshal signing.
 	issuerSerialDER []byte // pre-encoded issuerAndSerialNumber

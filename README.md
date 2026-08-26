@@ -15,10 +15,11 @@ High-performance PDF digital signing library and CLI in Go, built as a drop-in r
 - PFX (PKCS#12) and PEM certificate loading
 - `config.ini` support for easy deployment
 - Custom PDF parser — no pdfcpu in the signing hot path
-- Near-zero-allocation signing (5 allocs/op RSA, 0 allocs for parser and increment builder)
+- Near-zero-allocation signing (5 allocs/op RSA at any PDF size, 0 allocs for parser and increment builder)
 - Pooled CMS scratch buffers and xref maps for minimal GC pressure
 - Concurrent batch signing
-- Streaming and in-memory signing APIs
+- Streaming and in-memory signing APIs (streaming holds no per-size heap: 2KB/op on a 5MB PDF)
+- Atomic file output — a failed sign never leaves a truncated or unsigned file
 - Production-hardened HTTP server (graceful shutdown, concurrency limiter, health endpoint)
 
 ## Install
@@ -264,7 +265,7 @@ if err != nil {
 os.WriteFile("output.pdf", signed, 0644)
 ```
 
-### Sign streaming (low memory)
+### Sign streaming (constant memory)
 
 ```go
 src, _ := os.Open("input.pdf")
@@ -368,16 +369,24 @@ FLASHSIGN_TEST_PFX_PASSWORD=... go test -run LargePFX ./...
 
 ## Performance
 
-Benchmarked on Apple M4 Pro, Go 1.25, RSA-2048 key:
+Benchmarked on Apple M4 Pro (14 cores), Go 1.25, RSA-2048 key. Median of 5 runs.
 
 | Operation | ns/op | allocs/op | B/op |
 |---|---|---|---|
-| SignBytes (10KB PDF) | 780μs | 5 | 18KB |
-| SignBytes (1MB PDF) | 1.15ms | 6 | 1.0MB |
-| ParsePDF | 1.4μs | 0 | 0 |
-| BuildIncrement | 0.98μs | 0 | 0 |
-| CMS/PKCS7 Signature | 768μs | 3 | 1.9KB |
-| Parallel Visible Sign (10KB, 14 cores) | 92μs | 5 | 18KB |
+| SignBytes (10KB PDF) | 729μs | 5 | 18KB |
+| SignBytes (1MB PDF) | 1.07ms | 5 | 1.0MB |
+| SignStream (10KB PDF) | 745μs | 5 | 2.0KB |
+| SignStream (5MB PDF) | 2.60ms | 5 | 14KB |
+| SignStream (5MB, 14 cores) | 226μs | 5 | 2.0KB |
+| Parallel Visible Sign (10KB, 14 cores) | 72μs | 5 | 18KB |
+| SignBytes ECDSA P-384 (10KB PDF) | 24μs | 63 | 23KB |
+| ParsePDF | 1.2μs | 0 | 0 |
+| BuildIncrement | 0.92μs | 0 | 0 |
+| CMS/PKCS7 Signature | 724μs | 3 | 1.9KB |
+
+`SignStream` allocates a constant ~5 allocations regardless of PDF size: the
+source is read once into a pooled buffer and written straight through to the
+destination, so nothing scales with document size.
 
 ## Test and benchmark guide
 

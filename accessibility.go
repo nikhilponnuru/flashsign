@@ -29,9 +29,6 @@ import "bytes"
 // leaves the structure tree untouched.
 
 var (
-	kwSlashTabs               = []byte("/Tabs")
-	kwSlashViewerPreferences  = []byte("/ViewerPreferences")
-	kwSlashDisplayDocTitle    = []byte("/DisplayDocTitle")
 	kwDisplayDocTitleTrue     = []byte(" /DisplayDocTitle true >>")
 	kwViewerPreferencesPrefix = []byte("\n/ViewerPreferences <<")
 	kwTabsStructure           = []byte("\n/Tabs /S")

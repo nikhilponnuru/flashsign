@@ -14,16 +14,6 @@ import (
 // purposes (bit 5), modification and assembly stay disallowed.
 const accessiblePermissions = model.PermissionsPrint | model.PermissionExtractRev3
 
-// encryptPDF applies AES encryption to a PDF file.
-func encryptPDF(inputPath, outputPath, password string, keyLength int) error {
-	if keyLength != 128 && keyLength != 256 {
-		keyLength = 128
-	}
-	conf := model.NewAESConfiguration(password, password, keyLength)
-	conf.Permissions = accessiblePermissions
-	return api.EncryptFile(inputPath, outputPath, conf)
-}
-
 func newEncryptConf(password string, keyLength int) *model.Configuration {
 	if keyLength != 128 && keyLength != 256 {
 		keyLength = 128

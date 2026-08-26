@@ -1,7 +1,6 @@
 package flashsign
 
 import (
-	"bytes"
 	"sync"
 	"time"
 )
@@ -21,12 +20,6 @@ var slicePool = sync.Pool{
 		return &b
 	},
 }
-
-// Package-level key byte slices for appendDictWithoutKey (avoids string concat + []byte alloc).
-var (
-	kwSlashAcroForm = []byte("/AcroForm")
-	kwSlashAnnots   = []byte("/Annots")
-)
 
 func (s *Signer) buildIncrement(buf []byte, pi *pdfInfo, srcSize int64, reason, contact, location string, rect Rectangle, visible bool, signingTime time.Time) ([]byte, incrOffsets, error) {
 	// Allocate object numbers.
@@ -53,26 +46,36 @@ func (s *Signer) buildIncrement(buf []byte, pi *pdfInfo, srcSize int64, reason, 
 	buf = append(buf, '\n')
 
 	// Track xref entries in a fixed-size array (max 7 objects: sig, widget,
-	// appearance, font, catalog, page, viewer preferences).
+	// appearance, font, catalog, page, viewer preferences). Rewritten objects
+	// keep the generation they already had; new objects start at generation 0.
 	type xrefEnt struct {
 		objNr  int
+		gen    int
 		offset int64
 	}
 	var xrefEntries [7]xrefEnt
 	xrefCount := 0
 	baseOffset := srcSize
 
-	recordOffset := func(objNr int) {
-		xrefEntries[xrefCount] = xrefEnt{objNr: objNr, offset: baseOffset + int64(len(buf))}
+	recordOffset := func(objNr, gen int) {
+		xrefEntries[xrefCount] = xrefEnt{objNr: objNr, gen: gen, offset: baseOffset + int64(len(buf))}
 		xrefCount++
+	}
+
+	// appendObjHeader starts an object definition ("N G obj").
+	appendObjHeader := func(buf []byte, objNr, gen int) []byte {
+		buf = appendInt(buf, objNr)
+		buf = append(buf, ' ')
+		buf = appendInt(buf, gen)
+		return append(buf, " obj\n<<"...)
 	}
 
 	var offsets incrOffsets
 
 	// === Signature Value Dictionary ===
-	recordOffset(sigValueObjNr)
-	buf = appendInt(buf, sigValueObjNr)
-	buf = append(buf, " 0 obj\n<<\n/Type /Sig\n/Filter /Adobe.PPKLite\n/SubFilter /adbe.pkcs7.detached\n"...)
+	recordOffset(sigValueObjNr, 0)
+	buf = appendObjHeader(buf, sigValueObjNr, 0)
+	buf = append(buf, "\n/Type /Sig\n/Filter /Adobe.PPKLite\n/SubFilter /adbe.pkcs7.detached\n"...)
 	offsets.byteRangeInIncr = len(buf)
 	buf = append(buf, byteRangePlaceholder...)
 	buf = append(buf, '\n')
@@ -106,13 +109,13 @@ func (s *Signer) buildIncrement(buf []byte, pi *pdfInfo, srcSize int64, reason, 
 	buf = append(buf, ")\n>>\nendobj\n\n"...)
 
 	// === Widget Annotation ===
-	recordOffset(widgetObjNr)
-	buf = appendInt(buf, widgetObjNr)
-	buf = append(buf, " 0 obj\n<<\n/Type /Annot\n/Subtype /Widget\n/FT /Sig\n/T (Signature1)\n/V "...)
-	buf = appendInt(buf, sigValueObjNr)
-	buf = append(buf, " 0 R\n/F 132\n/P "...)
-	buf = appendInt(buf, pi.pageObjNr)
-	buf = append(buf, " 0 R\n"...)
+	recordOffset(widgetObjNr, 0)
+	buf = appendObjHeader(buf, widgetObjNr, 0)
+	buf = append(buf, "\n/Type /Annot\n/Subtype /Widget\n/FT /Sig\n/T (Signature1)\n/V "...)
+	buf = appendObjRef(buf, sigValueObjNr, 0)
+	buf = append(buf, "\n/F 132\n/P "...)
+	buf = appendObjRef(buf, pi.pageObjNr, pi.pageGen)
+	buf = append(buf, '\n')
 	if pi.tagged {
 		// Alternate field description for assistive technology (PDF/UA-1 7.18.6.2).
 		buf = append(buf, "/TU ("...)
@@ -145,14 +148,14 @@ func (s *Signer) buildIncrement(buf []byte, pi *pdfInfo, srcSize int64, reason, 
 		height := rect.Y2 - rect.Y1
 
 		// Font object.
-		recordOffset(fontObjNr)
+		recordOffset(fontObjNr, 0)
 		buf = appendInt(buf, fontObjNr)
 		buf = append(buf, " 0 obj\n<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /Encoding /WinAnsiEncoding >>\nendobj\n\n"...)
 
 		// Form XObject with placeholder /Length (patched after stream content).
-		recordOffset(appearanceObjNr)
-		buf = appendInt(buf, appearanceObjNr)
-		buf = append(buf, " 0 obj\n<<\n/Type /XObject\n/Subtype /Form\n/FormType 1\n/BBox [0 0 "...)
+		recordOffset(appearanceObjNr, 0)
+		buf = appendObjHeader(buf, appearanceObjNr, 0)
+		buf = append(buf, "\n/Type /XObject\n/Subtype /Form\n/FormType 1\n/BBox [0 0 "...)
 		buf = appendFloat(buf, width)
 		buf = append(buf, ' ')
 		buf = appendFloat(buf, height)
@@ -171,16 +174,15 @@ func (s *Signer) buildIncrement(buf []byte, pi *pdfInfo, srcSize int64, reason, 
 	}
 
 	// === Modified Catalog ===
-	recordOffset(pi.catalogObjNr)
-	buf = appendInt(buf, pi.catalogObjNr)
-	buf = append(buf, " 0 obj\n<<"...)
+	recordOffset(pi.catalogObjNr, pi.catalogGen)
+	buf = appendObjHeader(buf, pi.catalogObjNr, pi.catalogGen)
 	// Copy raw catalog dict, removing /AcroForm (and /ViewerPreferences when it
 	// is rewritten inline below). Everything else — /StructTreeRoot, /MarkInfo,
 	// /Lang, /Metadata, /Outlines — is preserved verbatim.
 	if inlineViewerPrefs {
-		buf = appendDictWithoutKeys2(buf, pi.catalogRaw, kwSlashAcroForm, kwSlashViewerPreferences)
+		buf = appendDictWithoutKeys2(buf, pi.catalogRaw, "AcroForm", "ViewerPreferences")
 	} else {
-		buf = appendDictWithoutKey(buf, pi.catalogRaw, kwSlashAcroForm)
+		buf = appendDictWithoutKey(buf, pi.catalogRaw, "AcroForm")
 	}
 	buf = append(buf, "\n/AcroForm << /Fields ["...)
 	if len(pi.existingFields) > 0 {
@@ -188,42 +190,40 @@ func (s *Signer) buildIncrement(buf []byte, pi *pdfInfo, srcSize int64, reason, 
 		buf = append(buf, pi.existingFields...)
 	}
 	buf = append(buf, ' ')
-	buf = appendInt(buf, widgetObjNr)
-	buf = append(buf, " 0 R] /SigFlags 3 >>"...)
+	buf = appendObjRef(buf, widgetObjNr, 0)
+	buf = append(buf, "] /SigFlags 3 >>"...)
 	if inlineViewerPrefs {
 		// Preserve existing viewer preferences (eg /Direction) and force
 		// /DisplayDocTitle true for tagged documents.
 		buf = append(buf, kwViewerPreferencesPrefix...)
-		buf = appendDictWithoutKey(buf, pi.viewerPrefsRaw, kwSlashDisplayDocTitle)
+		buf = appendDictWithoutKey(buf, pi.viewerPrefsRaw, "DisplayDocTitle")
 		buf = append(buf, kwDisplayDocTitleTrue...)
 	}
 	buf = append(buf, "\n>>\nendobj\n\n"...)
 
 	// === Modified /ViewerPreferences object (when referenced indirectly) ===
 	if updateViewerPrefsObj {
-		recordOffset(pi.viewerPrefsObjNr)
-		buf = appendInt(buf, pi.viewerPrefsObjNr)
-		buf = append(buf, " 0 obj\n<<"...)
-		buf = appendDictWithoutKey(buf, pi.viewerPrefsRaw, kwSlashDisplayDocTitle)
+		recordOffset(pi.viewerPrefsObjNr, 0)
+		buf = appendObjHeader(buf, pi.viewerPrefsObjNr, 0)
+		buf = appendDictWithoutKey(buf, pi.viewerPrefsRaw, "DisplayDocTitle")
 		buf = append(buf, kwDisplayDocTitleTrue...)
 		buf = append(buf, "\nendobj\n\n"...)
 	}
 
 	// === Modified Page ===
-	recordOffset(pi.pageObjNr)
-	buf = appendInt(buf, pi.pageObjNr)
-	buf = append(buf, " 0 obj\n<<"...)
+	recordOffset(pi.pageObjNr, pi.pageGen)
+	buf = appendObjHeader(buf, pi.pageObjNr, pi.pageGen)
 	// Copy raw page dict, removing /Annots. /StructParents and an existing
 	// /Tabs are preserved verbatim.
-	buf = appendDictWithoutKey(buf, pi.pageRaw, kwSlashAnnots)
+	buf = appendDictWithoutKey(buf, pi.pageRaw, "Annots")
 	buf = append(buf, "\n/Annots ["...)
 	if len(pi.existingAnnots) > 0 {
 		buf = append(buf, ' ')
 		buf = append(buf, pi.existingAnnots...)
 	}
 	buf = append(buf, ' ')
-	buf = appendInt(buf, widgetObjNr)
-	buf = append(buf, " 0 R]"...)
+	buf = appendObjRef(buf, widgetObjNr, 0)
+	buf = append(buf, ']')
 	if addTabs {
 		// The signature widget is an annotation on this page, so tab order must
 		// follow the structure tree (PDF/UA-1 7.18.3).
@@ -251,19 +251,21 @@ func (s *Signer) buildIncrement(buf []byte, pi *pdfInfo, srcSize int64, reason, 
 		buf = appendInt(buf, e.objNr)
 		buf = append(buf, " 1\n"...)
 		buf = appendZeroPad10(buf, e.offset)
-		buf = append(buf, " 00000 n \r\n"...)
+		buf = append(buf, ' ')
+		buf = appendZeroPad5(buf, e.gen)
+		buf = append(buf, " n \r\n"...)
 	}
 
 	// === Trailer ===
 	buf = append(buf, "trailer\n<<\n/Size "...)
 	buf = appendInt(buf, nextObj)
 	buf = append(buf, "\n/Root "...)
-	buf = appendInt(buf, pi.catalogObjNr)
-	buf = append(buf, " 0 R\n"...)
+	buf = appendObjRef(buf, pi.catalogObjNr, pi.catalogGen)
+	buf = append(buf, '\n')
 	if pi.infoObjNr > 0 {
 		buf = append(buf, "/Info "...)
-		buf = appendInt(buf, pi.infoObjNr)
-		buf = append(buf, " 0 R\n"...)
+		buf = appendObjRef(buf, pi.infoObjNr, pi.infoGen)
+		buf = append(buf, '\n')
 	}
 	if len(pi.idArray) > 0 {
 		buf = append(buf, "/ID "...)
@@ -279,9 +281,9 @@ func (s *Signer) buildIncrement(buf []byte, pi *pdfInfo, srcSize int64, reason, 
 	return buf, offsets, nil
 }
 
-// appendDictWithoutKey copies raw dict content to buf, removing the specified key entry.
-// key must be a package-level []byte like kwSlashAcroForm (avoids string alloc).
-func appendDictWithoutKey(buf []byte, raw []byte, key []byte) []byte {
+// appendDictWithoutKey copies raw dict content to buf, removing the specified
+// top-level key entry. key is given without its leading slash.
+func appendDictWithoutKey(buf []byte, raw []byte, key string) []byte {
 	entryStart, valueEnd := dictKeyRange(raw, key)
 	if entryStart < 0 {
 		// Key not found, copy everything.
@@ -295,7 +297,7 @@ func appendDictWithoutKey(buf []byte, raw []byte, key []byte) []byte {
 }
 
 // appendDictWithoutKeys2 copies raw dict content to buf, removing both key entries.
-func appendDictWithoutKeys2(buf []byte, raw []byte, keyA, keyB []byte) []byte {
+func appendDictWithoutKeys2(buf []byte, raw []byte, keyA, keyB string) []byte {
 	startA, endA := dictKeyRange(raw, keyA)
 	startB, endB := dictKeyRange(raw, keyB)
 
@@ -322,7 +324,7 @@ func appendDictWithoutKeys2(buf []byte, raw []byte, keyA, keyB []byte) []byte {
 // dictKeyRange returns the byte range [entryStart, valueEnd) covering a
 // top-level /Key plus its value inside raw dict content, or (-1, -1) when the
 // key is absent. entryStart includes whitespace preceding the key.
-func dictKeyRange(raw []byte, key []byte) (int, int) {
+func dictKeyRange(raw []byte, key string) (int, int) {
 	pos := findTopLevelKey(raw, key)
 	if pos < 0 {
 		return -1, -1
@@ -335,63 +337,12 @@ func dictKeyRange(raw []byte, key []byte) (int, int) {
 	}
 
 	// Skip past the key and any whitespace before the value.
-	keyEnd := pos + len(key)
+	keyEnd := pos + 1 + len(key)
 	for keyEnd < len(raw) && isSpace(raw[keyEnd]) {
 		keyEnd++
 	}
 
 	return entryStart, findValueEnd(raw, keyEnd)
-}
-
-// findTopLevelKey finds a /Key at the top level (depth 0) of dict content.
-func findTopLevelKey(dict []byte, key []byte) int {
-	depth := 0
-	inString := false
-
-	for i := 0; i < len(dict); {
-		b := dict[i]
-
-		if inString {
-			if b == '\\' && i+1 < len(dict) {
-				i += 2
-				continue
-			}
-			if b == ')' {
-				inString = false
-			}
-			i++
-			continue
-		}
-
-		switch b {
-		case '(':
-			inString = true
-			i++
-			continue
-		case '<':
-			if i+1 < len(dict) && dict[i+1] == '<' {
-				depth++
-				i += 2
-				continue
-			}
-		case '>':
-			if i+1 < len(dict) && dict[i+1] == '>' {
-				depth--
-				i += 2
-				continue
-			}
-		}
-
-		if depth == 0 && b == '/' && bytes.HasPrefix(dict[i:], key) {
-			endOfKey := i + len(key)
-			if endOfKey >= len(dict) || isPDFDelimiter(dict[endOfKey]) {
-				return i
-			}
-		}
-
-		i++
-	}
-	return -1
 }
 
 // resolveParams merges per-document SignParams with the Config defaults.

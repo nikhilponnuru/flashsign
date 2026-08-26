@@ -685,7 +685,7 @@ func TestAppendDictWithoutKeys2(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got := string(appendDictWithoutKeys2(nil, []byte(tt.raw), kwSlashAcroForm, kwSlashViewerPreferences))
+			got := string(appendDictWithoutKeys2(nil, []byte(tt.raw), "AcroForm", "ViewerPreferences"))
 			if got != tt.want {
 				t.Errorf("appendDictWithoutKeys2()\n got: %q\nwant: %q", got, tt.want)
 			}
@@ -697,7 +697,7 @@ func TestAppendDictWithoutKeyPrettyPrinted(t *testing.T) {
 	// Regression: the value scan must skip newlines between key and value,
 	// otherwise the orphaned dict value would corrupt the rewritten object.
 	raw := "/Type /Page\n/Annots\n[6 0 R]\n/Contents 5 0 R"
-	got := string(appendDictWithoutKey(nil, []byte(raw), kwSlashAnnots))
+	got := string(appendDictWithoutKey(nil, []byte(raw), "Annots"))
 	want := "/Type /Page\n/Contents 5 0 R"
 	if got != want {
 		t.Errorf("appendDictWithoutKey()\n got: %q\nwant: %q", got, want)

@@ -1,6 +1,7 @@
 package flashsign
 
 import (
+	"bytes"
 	"os"
 	"path/filepath"
 	"testing"
@@ -30,8 +31,14 @@ func TestEncryptPDF(t *testing.T) {
 				t.Fatalf("write temp input PDF: %v", err)
 			}
 
-			if err := encryptPDF(inPath, outPath, "secret", tt.keyLength); err != nil {
-				t.Fatalf("encryptPDF(%s) returned error: %v", tt.name, err)
+			out, err := os.Create(outPath)
+			if err != nil {
+				t.Fatalf("create output PDF: %v", err)
+			}
+			err = encryptPDFStream(bytes.NewReader(inData), out, "secret", tt.keyLength)
+			out.Close()
+			if err != nil {
+				t.Fatalf("encryptPDFStream(%s) returned error: %v", tt.name, err)
 			}
 
 			outData, err := os.ReadFile(outPath)

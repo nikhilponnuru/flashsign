@@ -257,7 +257,7 @@ func main() {
 	if *visible {
 		v := true
 		params.Visible = &v
-		rect := normalizeRect(flashsign.Rectangle{X1: *x1, Y1: *y1, X2: *x2, Y2: *y2})
+		rect := flashsign.Rectangle{X1: *x1, Y1: *y1, X2: *x2, Y2: *y2}
 		params.Rect = &rect
 	}
 
@@ -288,7 +288,7 @@ func main() {
 			location: *location,
 			page:     *page,
 			visible:  *visible,
-			rect:     normalizeRect(flashsign.Rectangle{X1: *x1, Y1: *y1, X2: *x2, Y2: *y2}),
+			rect:     flashsign.Rectangle{X1: *x1, Y1: *y1, X2: *x2, Y2: *y2},
 		}
 		if err := runServer(fmt.Sprintf("%s:%d", *host, *port), signer, d, *maxConcurrent); err != nil {
 			fatal("serve: %v", err)
@@ -383,7 +383,6 @@ func runServer(addr string, signer *flashsign.Signer, defaults serverDefaults, m
 			}
 			visible = true
 		}
-		rect = normalizeRect(rect)
 
 		params := flashsign.SignParams{
 			Src:      req.InputFile,
@@ -438,16 +437,6 @@ func runServer(addr string, signer *flashsign.Signer, defaults serverDefaults, m
 	case err := <-errCh:
 		return err
 	}
-}
-
-func normalizeRect(rect flashsign.Rectangle) flashsign.Rectangle {
-	if rect.X1 > rect.X2 {
-		rect.X1, rect.X2 = rect.X2, rect.X1
-	}
-	if rect.Y1 > rect.Y2 {
-		rect.Y1, rect.Y2 = rect.Y2, rect.Y1
-	}
-	return rect
 }
 
 // maybeRunCompatServerFromDefaultConfig preserves the legacy Java signer's startup behavior:
@@ -529,7 +518,7 @@ func maybeRunCompatServerFromDefaultConfig() (bool, error) {
 		location: cfg["location"],
 		page:     page,
 		visible:  visible,
-		rect:     normalizeRect(rect),
+		rect:     rect,
 	}
 	return true, runServer(fmt.Sprintf("%s:%d", host, port), signer, defaults, maxConcurrent)
 }

@@ -14,7 +14,9 @@ type pdfInfo struct {
 	nextObjNr      int
 	prevXrefOffset int64
 	catalogObjNr   int
+	catalogGen     int // generation of the catalog object, echoed by the rewrite
 	pageObjNr      int
+	pageGen        int    // generation of the signature page object
 	catalogRaw     []byte // raw catalog dict content (between << and >>)
 	pageRaw        []byte // raw page dict content
 	existingFields []byte // raw /Fields array content, or nil
@@ -146,14 +148,16 @@ func parsePDF(data []byte, targetPage int) (pdfInfo, error) {
 			// object number the increment reserves for new objects.
 			vpObjNr = 0
 		}
-		pageHasTabs = findTopLevelKey(pageRaw, kwSlashTabs) >= 0
+		pageHasTabs = findTopLevelKey(pageRaw, "Tabs") >= 0
 	}
 
 	return pdfInfo{
 		nextObjNr:      trailer.size,
 		prevXrefOffset: prevXrefOffset,
 		catalogObjNr:   trailer.rootObjNr,
+		catalogGen:     xref[trailer.rootObjNr].gen,
 		pageObjNr:      pageObjNr,
+		pageGen:        xref[pageObjNr].gen,
 		catalogRaw:     catalogRaw,
 		pageRaw:        pageRaw,
 		existingFields: existingFields,
@@ -169,22 +173,14 @@ func parsePDF(data []byte, targetPage int) (pdfInfo, error) {
 	}, nil
 }
 
-// parsePDFReader parses a PDF from an io.ReadSeeker.
-func parsePDFReader(src io.ReadSeeker, srcSize int64, targetPage int) (pdfInfo, error) {
-	if _, err := src.Seek(0, io.SeekStart); err != nil {
-		return pdfInfo{}, fmt.Errorf("seek start: %w", err)
-	}
-	data := make([]byte, srcSize)
-	if _, err := io.ReadFull(src, data); err != nil {
-		return pdfInfo{}, fmt.Errorf("read source: %w", err)
-	}
-	return parsePDF(data, targetPage)
-}
+// startxrefSearchWindow is how far back from EOF the trailing "startxref" is
+// looked for. Generous enough to survive producers that append a little junk
+// after %%EOF.
+const startxrefSearchWindow = 2048
 
 // findStartxref finds the byte offset of the most recent xref from the PDF tail.
 func findStartxref(data []byte) (int64, error) {
-	// Search the last 1KB.
-	searchStart := len(data) - 1024
+	searchStart := len(data) - startxrefSearchWindow
 	if searchStart < 0 {
 		searchStart = 0
 	}
@@ -234,8 +230,30 @@ func parseXrefChain(data []byte, startOffset int64) (map[int]xrefEntry, trailerI
 	var firstTrailer trailerInfo
 	first := true
 
+	// A /Prev chain that loops back on itself would otherwise spin forever, so
+	// remember the sections already visited. Kept as a fixed array: the chain is
+	// short in practice and this keeps the parser allocation-free.
+	const maxXrefSections = 64
+	var visited [maxXrefSections]int64
+	visitedCount := 0
+
 	offset := startOffset
 	for offset >= 0 {
+		for _, seen := range visited[:visitedCount] {
+			if seen == offset {
+				clear(xref)
+				xrefMapPool.Put(xref)
+				return nil, trailerInfo{}, fmt.Errorf("cyclic /Prev chain at offset %d", offset)
+			}
+		}
+		if visitedCount == maxXrefSections {
+			clear(xref)
+			xrefMapPool.Put(xref)
+			return nil, trailerInfo{}, fmt.Errorf("xref chain longer than %d sections", maxXrefSections)
+		}
+		visited[visitedCount] = offset
+		visitedCount++
+
 		var trailer trailerInfo
 		var err error
 
@@ -471,14 +489,13 @@ func readUint(b []byte, n int) int {
 
 // readStreamData reads and optionally decompresses stream data after a dict.
 func readStreamData(data []byte, dictContent []byte, dictEnd int) ([]byte, error) {
-	pos := dictEnd
-	pos = skipWhitespace(data, pos)
+	pos := skipWhitespace(data, dictEnd)
 
 	// Expect "stream" keyword.
 	if !bytes.HasPrefix(data[pos:], kwStream) {
 		return nil, fmt.Errorf("expected 'stream' keyword at %d", pos)
 	}
-	pos += 6
+	pos += len(kwStream)
 	// Skip \r\n or \n after "stream".
 	if pos < len(data) && data[pos] == '\r' {
 		pos++
@@ -487,14 +504,16 @@ func readStreamData(data []byte, dictContent []byte, dictEnd int) ([]byte, error
 		pos++
 	}
 
-	// Find "endstream".
-	endIdx := bytes.Index(data[pos:], kwEndstream)
-	if endIdx == -1 {
-		return nil, fmt.Errorf("endstream not found")
+	streamBytes, ok := streamBytesByLength(data, dictContent, pos)
+	if !ok {
+		// No usable /Length (missing, or an indirect reference): fall back to
+		// scanning for the keyword.
+		endIdx := bytes.Index(data[pos:], kwEndstream)
+		if endIdx == -1 {
+			return nil, fmt.Errorf("endstream not found")
+		}
+		streamBytes = bytes.TrimRight(data[pos:pos+endIdx], " \r\n")
 	}
-	streamBytes := data[pos : pos+endIdx]
-	// Trim trailing whitespace.
-	streamBytes = bytes.TrimRight(streamBytes, " \r\n")
 
 	// Check /Filter.
 	filterVal := extractDictValue(dictContent, "Filter")
@@ -502,6 +521,26 @@ func readStreamData(data []byte, dictContent []byte, dictEnd int) ([]byte, error
 		return inflateBytes(streamBytes)
 	}
 	return streamBytes, nil
+}
+
+// streamBytesByLength delimits the stream body using the dict's /Length, which
+// is authoritative: scanning for "endstream" misreads compressed data that
+// happens to contain those bytes. Reports false when /Length is absent, is an
+// indirect reference, or does not land on an "endstream" keyword — in which
+// case it cannot be trusted and the caller scans instead.
+func streamBytesByLength(data []byte, dictContent []byte, pos int) ([]byte, bool) {
+	lenVal := extractDictValue(dictContent, "Length")
+	if lenVal == nil {
+		return nil, false
+	}
+	n, width := parseInt(lenVal, skipWhitespaceInSlice(lenVal, 0))
+	if width == 0 || n < 0 || pos+n > len(data) {
+		return nil, false
+	}
+	if !bytes.HasPrefix(data[skipWhitespace(data, pos+n):], kwEndstream) {
+		return nil, false
+	}
+	return data[pos : pos+n], true
 }
 
 // inflateBytes decompresses FlateDecode data.
@@ -569,19 +608,7 @@ func readDictAt(data []byte, pos int) ([]byte, int, error) {
 		b := data[pos]
 		switch {
 		case b == '(':
-			// Skip string literal.
-			pos++
-			for pos < len(data) {
-				if data[pos] == '\\' {
-					pos += 2
-					continue
-				}
-				if data[pos] == ')' {
-					pos++
-					break
-				}
-				pos++
-			}
+			pos = skipPDFStringLiteral(data, pos)
 			continue
 		case b == '<' && pos+1 < len(data) && data[pos+1] == '<':
 			depth++
@@ -665,39 +692,48 @@ func readCompressedObject(data []byte, xref map[int]xrefEntry, objStreamNr int, 
 		return nil, fmt.Errorf("decompress object stream: %w", err)
 	}
 
-	// Parse header: N pairs of (objNum offset).
-	type objEntry struct {
-		objNr  int
-		offset int
+	// Scan the header's N "objNr offset" pairs, keeping only the two the target
+	// needs: its own start, and the next object's start, which bounds it. This
+	// avoids materialising all N entries just to read one.
+	if index < 0 || index >= n {
+		return nil, fmt.Errorf("index %d out of range for object stream (has %d objects)", index, n)
 	}
-	entries := make([]objEntry, 0, n)
+	start, end := -1, len(streamData)
+	foundObjNr := 0
 	hpos := 0
 	for i := 0; i < n; i++ {
 		hpos = skipWhitespaceInSlice(streamData, hpos)
-		objNr, nn := parseInt(streamData, hpos)
-		hpos += nn
+		objNr, w := parseInt(streamData, hpos)
+		if w == 0 {
+			break
+		}
+		hpos += w
 		hpos = skipWhitespaceInSlice(streamData, hpos)
-		off, nn := parseInt(streamData, hpos)
-		hpos += nn
-		entries = append(entries, objEntry{objNr: objNr, offset: first + off})
+		off, w := parseInt(streamData, hpos)
+		if w == 0 {
+			break
+		}
+		hpos += w
+
+		switch i {
+		case index:
+			foundObjNr, start = objNr, first+off
+		case index + 1:
+			end = first + off
+		}
 	}
 
-	// Find the target entry by index.
-	if index >= len(entries) {
-		return nil, fmt.Errorf("index %d out of range for object stream (has %d objects)", index, len(entries))
+	if start < 0 {
+		return nil, fmt.Errorf("truncated object stream header: object %d not listed", targetObjNr)
 	}
-	entry := entries[index]
-	if entry.objNr != targetObjNr {
-		return nil, fmt.Errorf("object number mismatch: expected %d, got %d", targetObjNr, entry.objNr)
+	if foundObjNr != targetObjNr {
+		return nil, fmt.Errorf("object number mismatch: expected %d, got %d", targetObjNr, foundObjNr)
 	}
-
-	// Extract the object data.
-	start := entry.offset
-	var end int
-	if index+1 < len(entries) {
-		end = entries[index+1].offset
-	} else {
+	if end > len(streamData) {
 		end = len(streamData)
+	}
+	if start > end {
+		return nil, fmt.Errorf("object %d lies outside its object stream", targetObjNr)
 	}
 
 	objData := bytes.TrimSpace(streamData[start:end])
@@ -714,34 +750,16 @@ func readCompressedObject(data []byte, xref map[int]xrefEntry, objStreamNr int, 
 	return objData, nil
 }
 
-// extractDictValue extracts the value for /Key from raw dict content bytes.
-// Returns nil if the key is not found.
-func extractDictValue(dict []byte, key string) []byte {
-	searchKey := "/" + key
-	keyBytes := []byte(searchKey)
-
+// findTopLevelKey returns the index of the "/key" entry at the top level
+// (depth 0) of raw dict content, or -1 when the key is absent. key is given
+// without its leading slash, as for extractDictValue.
+func findTopLevelKey(dict []byte, key string) int {
 	depth := 0
-	inString := false
 
 	for i := 0; i < len(dict); {
-		b := dict[i]
-
-		if inString {
-			if b == '\\' && i+1 < len(dict) {
-				i += 2
-				continue
-			}
-			if b == ')' {
-				inString = false
-			}
-			i++
-			continue
-		}
-
-		switch b {
+		switch dict[i] {
 		case '(':
-			inString = true
-			i++
+			i = skipPDFStringLiteral(dict, i)
 			continue
 		case '<':
 			if i+1 < len(dict) && dict[i+1] == '<' {
@@ -755,27 +773,59 @@ func extractDictValue(dict []byte, key string) []byte {
 				i += 2
 				continue
 			}
-		}
-
-		// Only match at top level.
-		if depth == 0 && b == '/' && bytes.HasPrefix(dict[i:], keyBytes) {
-			endOfKey := i + len(keyBytes)
-			// Ensure the key is followed by a delimiter.
-			if endOfKey >= len(dict) || isPDFDelimiter(dict[endOfKey]) {
-				// Extract the value starting after the key. Skip all whitespace so
-				// pretty-printed dicts ("/Key\n<< ... >>") resolve correctly too.
-				valStart := endOfKey
-				for valStart < len(dict) && isSpace(dict[valStart]) {
-					valStart++
-				}
-				valEnd := findValueEnd(dict, valStart)
-				return dict[valStart:valEnd]
+		case '/':
+			if depth == 0 && isKeyAt(dict, i+1, key) {
+				return i
 			}
 		}
-
 		i++
 	}
-	return nil
+	return -1
+}
+
+// isKeyAt reports whether dict[pos:] starts with key followed by a PDF
+// delimiter, so that "/N" does not match inside "/Name". Comparing the
+// sub-slice against a string directly avoids the copy a []byte(key)
+// conversion would cost on every call.
+func isKeyAt(dict []byte, pos int, key string) bool {
+	end := pos + len(key)
+	if end > len(dict) || string(dict[pos:end]) != key {
+		return false
+	}
+	return end == len(dict) || isPDFDelimiter(dict[end])
+}
+
+// extractDictValue extracts the value for /Key from raw dict content bytes.
+// key is given without its leading slash. Returns nil if the key is not found.
+func extractDictValue(dict []byte, key string) []byte {
+	pos := findTopLevelKey(dict, key)
+	if pos < 0 {
+		return nil
+	}
+	// Skip all whitespace after the key so pretty-printed dicts
+	// ("/Key\n<< ... >>") resolve correctly too.
+	valStart := pos + 1 + len(key)
+	for valStart < len(dict) && isSpace(dict[valStart]) {
+		valStart++
+	}
+	return dict[valStart:findValueEnd(dict, valStart)]
+}
+
+// skipPDFStringLiteral returns the index just past the ')' that closes the
+// string literal starting at data[pos] == '(', or len(data) if it is
+// unterminated.
+func skipPDFStringLiteral(data []byte, pos int) int {
+	for i := pos + 1; i < len(data); {
+		switch data[i] {
+		case '\\':
+			i += 2
+		case ')':
+			return i + 1
+		default:
+			i++
+		}
+	}
+	return len(data)
 }
 
 // findValueEnd finds the end of a PDF value starting at pos.
@@ -792,18 +842,7 @@ func findValueEnd(dict []byte, pos int) int {
 		i := pos + 2
 		for i < len(dict) && depth > 0 {
 			if dict[i] == '(' {
-				i++
-				for i < len(dict) {
-					if dict[i] == '\\' {
-						i += 2
-						continue
-					}
-					if dict[i] == ')' {
-						i++
-						break
-					}
-					i++
-				}
+				i = skipPDFStringLiteral(dict, i)
 				continue
 			}
 			if dict[i] == '<' && i+1 < len(dict) && dict[i+1] == '<' {
@@ -825,18 +864,7 @@ func findValueEnd(dict []byte, pos int) int {
 		i := pos + 1
 		for i < len(dict) && depth > 0 {
 			if dict[i] == '(' {
-				i++
-				for i < len(dict) {
-					if dict[i] == '\\' {
-						i += 2
-						continue
-					}
-					if dict[i] == ')' {
-						i++
-						break
-					}
-					i++
-				}
+				i = skipPDFStringLiteral(dict, i)
 				continue
 			}
 			if dict[i] == '[' {
@@ -850,18 +878,7 @@ func findValueEnd(dict []byte, pos int) int {
 		return i
 	case b == '(':
 		// String literal: find matching )
-		i := pos + 1
-		for i < len(dict) {
-			if dict[i] == '\\' {
-				i += 2
-				continue
-			}
-			if dict[i] == ')' {
-				return i + 1
-			}
-			i++
-		}
-		return i
+		return skipPDFStringLiteral(dict, pos)
 	case b == '<':
 		// Hex string: find >
 		i := pos + 1
@@ -1246,18 +1263,7 @@ func findMatchingBracket(data []byte, pos int) int {
 	i := pos + 1
 	for i < len(data) && depth > 0 {
 		if data[i] == '(' {
-			i++
-			for i < len(data) {
-				if data[i] == '\\' {
-					i += 2
-					continue
-				}
-				if data[i] == ')' {
-					i++
-					break
-				}
-				i++
-			}
+			i = skipPDFStringLiteral(data, i)
 			continue
 		}
 		if data[i] == '[' {

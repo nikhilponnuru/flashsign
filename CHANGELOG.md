@@ -5,6 +5,53 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+
+- Rewritten objects now keep their own generation number. The increment builder
+  hard-coded generation 0 in object headers, xref entries and the trailer's
+  `/Root` and `/Info` references, so signing a PDF whose catalog, signature page
+  or `/Info` dictionary sat at a non-zero generation produced a document with
+  dangling references.
+- A cyclic `/Prev` chain in the cross-reference table no longer hangs the parser.
+  Visited sections are tracked and a loop (or a chain longer than 64 sections) is
+  reported as an error.
+- Stream bodies are delimited by the dictionary's `/Length` when it is a direct
+  integer that lands on an `endstream` keyword. Scanning for the keyword alone
+  truncated compressed streams whose data happened to contain those bytes; the
+  scan remains as the fallback for indirect or missing `/Length`.
+- `Sign` and `SignAndEncrypt` stage output in a temporary file and rename it over
+  the destination, so a failure part-way through no longer leaves a truncated or
+  unsigned file where the signed one should be. Previously only the in-place path
+  did this.
+- Xref-stream detection reads the `startxref` target instead of scanning the last
+  megabyte for `/Type/XRef`. The scan missed linearised files whose xref stream is
+  not near the end, and needlessly rewrote hybrid-reference files that already
+  carry a classic table.
+
+### Changed
+
+- `SignStream` reads the source once into a pooled buffer instead of reading it
+  whole for parsing and then streaming over it twice more to hash and to copy.
+  Memory per operation drops 83–99.96% (5MB PDF, 14 cores: 5.0MB → 2.0KB) and
+  settles at a constant 5 allocations regardless of document size. Parallel
+  latency falls 22–32% for PDFs of 500KB and up.
+- PDF parsing no longer rebuilds the search key on every dictionary lookup, and
+  the dictionary scanner is shared with the increment builder rather than
+  duplicated. `ParsePDF` is ~22% faster and `BuildIncrement` ~5% faster, both
+  still allocation-free.
+- `SignBatch` workers pull from an atomic cursor rather than a buffered channel
+  sized to the batch.
+- `Sign` no longer fsyncs before renaming. The replacement is still atomic for
+  readers; contents are not guaranteed durable across a power loss.
+
+### Removed
+
+- Dead code: the write-only `sigMaxLen` field, the unused `appendDEROctetString`
+  helper, `parsePDFReader`, the test-only `encryptPDF` wrapper, and the CLI's
+  `normalizeRect`, which duplicated normalisation the library already does.
+
 ## [0.2.1] - 2026-08-26
 
 ### Fixed

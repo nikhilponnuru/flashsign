@@ -32,6 +32,25 @@ func appendZeroPad10(dst []byte, n int64) []byte {
 	return append(dst, tmp[:]...)
 }
 
+// appendZeroPad5 appends a 5-digit zero-padded decimal representation of n to
+// dst, the width an xref entry reserves for a generation number.
+func appendZeroPad5(dst []byte, n int) []byte {
+	var tmp [5]byte
+	for i := 4; i >= 0; i-- {
+		tmp[i] = byte('0' + n%10)
+		n /= 10
+	}
+	return append(dst, tmp[:]...)
+}
+
+// appendObjRef appends a PDF indirect reference ("N G R") to buf.
+func appendObjRef(buf []byte, objNr, gen int) []byte {
+	buf = appendInt(buf, objNr)
+	buf = append(buf, ' ')
+	buf = appendInt(buf, gen)
+	return append(buf, " R"...)
+}
+
 // formatByteRange formats the ByteRange string directly into dst starting at pos.
 func formatByteRange(dst []byte, pos int, a, b, c int64) {
 	copy(dst[pos:], "/ByteRange [0 ")

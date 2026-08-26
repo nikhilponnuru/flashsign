@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/pdfcpu/pdfcpu/pkg/api"
@@ -47,178 +48,168 @@ func (s *Signer) releaseDigest(h hash.Hash) {
 	hashPoolSHA256.Put(h)
 }
 
-// SignBytes signs PDF bytes in memory and returns the signed PDF bytes.
-func (s *Signer) SignBytes(pdfData []byte, params SignParams) ([]byte, error) {
+// pendingSignature is a built incremental update whose /Contents placeholder is
+// still waiting for its CMS signature.
+type pendingSignature struct {
+	incr        []byte  // the increment, aliasing buf
+	buf         *[]byte // pooled backing buffer; the caller returns it to slicePool
+	offsets     incrOffsets
+	signingTime time.Time
+}
+
+// prepareIncrement parses the PDF and builds its incremental update, with
+// /ByteRange already patched to the offsets the finished document will have.
+//
+// buf is non-nil on every return, error paths included, and the caller must
+// hand it back to slicePool.
+func (s *Signer) prepareIncrement(pdfData []byte, params SignParams) (pendingSignature, error) {
 	reason, contact, location, page, rect, visible := s.resolveParams(params)
-	signingTime := time.Now().UTC()
 	srcSize := int64(len(pdfData))
 
-	// Parse PDF structure using custom parser (no pdfcpu).
+	p := pendingSignature{
+		buf:         slicePool.Get().(*[]byte),
+		signingTime: time.Now().UTC(),
+	}
+
+	// Parse PDF structure using the custom parser (no pdfcpu).
 	pi, err := parsePDF(pdfData, page)
 	if err != nil {
-		return nil, err
+		return p, err
 	}
 
-	// Get pooled buffer for increment.
-	bp := slicePool.Get().(*[]byte)
-
-	// Build incremental update.
-	incr, offsets, err := s.buildIncrement(*bp, &pi, srcSize, reason, contact, location, rect, visible, signingTime)
+	p.incr, p.offsets, err = s.buildIncrement(*p.buf, &pi, srcSize, reason, contact, location, rect, visible, p.signingTime)
+	*p.buf = p.incr
 	if err != nil {
-		*bp = incr
-		slicePool.Put(bp)
-		return nil, err
+		return p, err
 	}
 
-	// Combine original + increment into a single contiguous buffer.
-	result := make([]byte, len(pdfData)+len(incr))
-	copy(result, pdfData)
-	copy(result[len(pdfData):], incr)
+	// The signed document is pdfData followed by the increment, so
+	// increment-relative offsets become absolute by adding srcSize. The two
+	// signed ranges straddle the /Contents value, angle brackets included.
+	contentValueStart := srcSize + int64(p.offsets.contentsHexInIncr) - 1
+	contentValueEnd := srcSize + int64(p.offsets.contentsHexEndIncr) + 1
+	totalLen := srcSize + int64(len(p.incr))
+	formatByteRange(p.incr, p.offsets.byteRangeInIncr, contentValueStart, contentValueEnd, totalLen-contentValueEnd)
 
-	// Return increment buffer to pool.
-	*bp = incr
-	slicePool.Put(bp)
+	return p, nil
+}
 
-	// Compute absolute positions.
-	contentValueStart := srcSize + int64(offsets.contentsHexInIncr) - 1
-	contentValueEnd := srcSize + int64(offsets.contentsHexEndIncr) + 1
-	totalLen := int64(len(result))
-
-	// Patch ByteRange.
-	byteRangePos := int(srcSize) + offsets.byteRangeInIncr
-	formatByteRange(result, byteRangePos, contentValueStart, contentValueEnd, totalLen-contentValueEnd)
-
-	// Hash signed ranges.
+// signInto digests head followed by incr — everything except the /Contents
+// value the two enclose — then builds the CMS signature and writes it into that
+// placeholder. head and incr must together be the complete signed document, in
+// that order.
+func (s *Signer) signInto(head, incr []byte, offsets incrOffsets, signingTime time.Time) error {
 	h := s.acquireDigest()
-	h.Reset()
-	h.Write(result[:contentValueStart])
-	h.Write(result[contentValueEnd:])
+	h.Write(head)
+	h.Write(incr[:offsets.contentsHexInIncr-1])
+	h.Write(incr[offsets.contentsHexEndIncr+1:])
 	var contentHashBuf [48]byte // 48 = max for SHA-384
 	contentHash := h.Sum(contentHashBuf[:0])
 	s.releaseDigest(h)
 
-	// Build CMS signature.
 	cmsSig, err := s.buildCMSSignature(contentHash, signingTime)
 	if err != nil {
-		return nil, fmt.Errorf("build CMS signature: %w", err)
+		return fmt.Errorf("build CMS signature: %w", err)
 	}
 
-	// Hex-encode and patch Contents.
 	sigHexLen := len(cmsSig) * 2
 	if sigHexLen > s.contentsPlaceholderLen {
-		return nil, fmt.Errorf("CMS signature too large: %d hex chars (max %d)", sigHexLen, s.contentsPlaceholderLen)
+		return fmt.Errorf("CMS signature too large: %d hex chars (max %d)", sigHexLen, s.contentsPlaceholderLen)
 	}
-	contentsHexStart := int(srcSize) + offsets.contentsHexInIncr
-	encodeUpperHex(result[contentsHexStart:contentsHexStart+sigHexLen], cmsSig)
+	encodeUpperHex(incr[offsets.contentsHexInIncr:offsets.contentsHexInIncr+sigHexLen], cmsSig)
+	return nil
+}
 
+// SignBytes signs PDF bytes in memory and returns the signed PDF bytes.
+func (s *Signer) SignBytes(pdfData []byte, params SignParams) ([]byte, error) {
+	p, err := s.prepareIncrement(pdfData, params)
+	if err != nil {
+		slicePool.Put(p.buf)
+		return nil, err
+	}
+
+	// Assemble the signed document before digesting it, so the digest is a
+	// single linear pass over the finished buffer rather than a second pass
+	// over the caller's input.
+	result := make([]byte, len(pdfData)+len(p.incr))
+	copy(result, pdfData)
+	incr := result[len(pdfData):]
+	copy(incr, p.incr)
+	slicePool.Put(p.buf)
+
+	if err := s.signInto(result[:len(pdfData)], incr, p.offsets, p.signingTime); err != nil {
+		return nil, err
+	}
 	return result, nil
 }
 
-// SignStream signs a PDF by reading from src and writing the signed PDF to dst.
-func (s *Signer) SignStream(src io.ReadSeeker, dst io.Writer, params SignParams) error {
-	reason, contact, location, page, rect, visible := s.resolveParams(params)
-	signingTime := time.Now().UTC()
+// srcBufPool holds buffers used by SignStream to read a whole source PDF.
+var srcBufPool = sync.Pool{
+	New: func() any {
+		b := make([]byte, 0, 256*1024)
+		return &b
+	},
+}
 
+// maxPooledSrcBuf caps what goes back into srcBufPool so one outsized PDF does
+// not pin its buffer for the life of the process.
+const maxPooledSrcBuf = 8 << 20
+
+// SignStream signs a PDF by reading from src and writing the signed PDF to dst.
+// Unlike SignBytes it never allocates a buffer holding both the source and the
+// signed output; src is read once into a pooled buffer and written straight
+// through to dst.
+func (s *Signer) SignStream(src io.ReadSeeker, dst io.Writer, params SignParams) error {
 	srcSize, err := src.Seek(0, io.SeekEnd)
 	if err != nil {
 		return fmt.Errorf("seek end: %w", err)
 	}
+	if _, err := src.Seek(0, io.SeekStart); err != nil {
+		return fmt.Errorf("seek start: %w", err)
+	}
 
-	// Parse PDF structure.
-	pi, err := parsePDFReader(src, srcSize, page)
+	sp := srcBufPool.Get().(*[]byte)
+	data := *sp
+	if int64(cap(data)) >= srcSize {
+		data = data[:srcSize]
+	} else {
+		data = make([]byte, srcSize)
+	}
+	defer func() {
+		if cap(data) <= maxPooledSrcBuf {
+			*sp = data[:0]
+			srcBufPool.Put(sp)
+		}
+	}()
+
+	if _, err := io.ReadFull(src, data); err != nil {
+		return fmt.Errorf("read source: %w", err)
+	}
+
+	p, err := s.prepareIncrement(data, params)
+	defer slicePool.Put(p.buf)
 	if err != nil {
 		return err
 	}
-
-	// Get pooled buffer for increment.
-	bp := slicePool.Get().(*[]byte)
-
-	// Build incremental update.
-	incr, offsets, err := s.buildIncrement(*bp, &pi, srcSize, reason, contact, location, rect, visible, signingTime)
-	if err != nil {
-		*bp = incr
-		slicePool.Put(bp)
+	if err := s.signInto(data, p.incr, p.offsets, p.signingTime); err != nil {
 		return err
 	}
 
-	incrBytes := incr
-
-	// Compute absolute positions.
-	contentValueStart := srcSize + int64(offsets.contentsHexInIncr) - 1
-	contentValueEnd := srcSize + int64(offsets.contentsHexEndIncr) + 1
-	totalLen := srcSize + int64(len(incrBytes))
-
-	// Patch ByteRange.
-	formatByteRange(incrBytes, offsets.byteRangeInIncr, contentValueStart, contentValueEnd, totalLen-contentValueEnd)
-
-	// Hash signed ranges.
-	contentsIncrStart := offsets.contentsHexInIncr - 1
-	contentsIncrEnd := offsets.contentsHexEndIncr + 1
-
-	h := s.acquireDigest()
-	h.Reset()
-
-	if _, err := src.Seek(0, io.SeekStart); err != nil {
-		s.releaseDigest(h)
-		*bp = incr
-		slicePool.Put(bp)
-		return fmt.Errorf("seek start for hash: %w", err)
-	}
-	if _, err := io.Copy(h, src); err != nil {
-		s.releaseDigest(h)
-		*bp = incr
-		slicePool.Put(bp)
-		return fmt.Errorf("hash src: %w", err)
-	}
-	h.Write(incrBytes[:contentsIncrStart])
-	h.Write(incrBytes[contentsIncrEnd:])
-
-	var contentHashBuf [48]byte
-	contentHash := h.Sum(contentHashBuf[:0])
-	s.releaseDigest(h)
-
-	// Build CMS signature.
-	cmsSig, err := s.buildCMSSignature(contentHash, signingTime)
-	if err != nil {
-		*bp = incr
-		slicePool.Put(bp)
-		return fmt.Errorf("build CMS signature: %w", err)
-	}
-
-	// Hex-encode into increment buffer.
-	sigHexLen := len(cmsSig) * 2
-	if sigHexLen > s.contentsPlaceholderLen {
-		*bp = incr
-		slicePool.Put(bp)
-		return fmt.Errorf("CMS signature too large: %d hex chars (max %d)", sigHexLen, s.contentsPlaceholderLen)
-	}
-	encodeUpperHex(incrBytes[offsets.contentsHexInIncr:offsets.contentsHexInIncr+sigHexLen], cmsSig)
-
-	// Write output.
-	if _, err := src.Seek(0, io.SeekStart); err != nil {
-		*bp = incr
-		slicePool.Put(bp)
-		return fmt.Errorf("seek start for write: %w", err)
-	}
-	if _, err := io.Copy(dst, src); err != nil {
-		*bp = incr
-		slicePool.Put(bp)
+	if _, err := dst.Write(data); err != nil {
 		return fmt.Errorf("write src to dst: %w", err)
 	}
-	if _, err := dst.Write(incrBytes); err != nil {
-		*bp = incr
-		slicePool.Put(bp)
+	if _, err := dst.Write(p.incr); err != nil {
 		return fmt.Errorf("write increment to dst: %w", err)
 	}
-
-	// Return buffer to pool.
-	*bp = incr
-	slicePool.Put(bp)
-
 	return nil
 }
 
 // Sign signs a PDF file and writes the result to the destination path.
+// Output is staged in a temporary file and renamed over the destination, so a
+// failure never leaves a truncated or unsigned file behind and readers only
+// ever see the old or the new document. The rename is not fsynced, so contents
+// are not guaranteed durable across a power loss. Signing in place
+// (Dest == Src, or an empty Dest) is supported.
 func (s *Signer) Sign(params SignParams) error {
 	srcPath := params.Src
 	destPath := params.Dest
@@ -232,38 +223,17 @@ func (s *Signer) Sign(params SignParams) error {
 	}
 	defer cleanupPreparedSrc()
 
-	if sameFilePath(srcPath, destPath) {
-		return s.signInPlace(params, preparedSrcPath, destPath)
-	}
-
 	srcFile, err := os.Open(preparedSrcPath)
 	if err != nil {
 		return fmt.Errorf("open input PDF: %w", err)
 	}
 	defer srcFile.Close()
 
-	dstFile, err := os.Create(destPath)
-	if err != nil {
-		return fmt.Errorf("create output PDF: %w", err)
-	}
-	defer dstFile.Close()
-
-	if err := s.SignStream(srcFile, dstFile, params); err != nil {
-		return fmt.Errorf("sign PDF: %w", err)
-	}
-	return nil
-}
-
-func (s *Signer) signInPlace(params SignParams, srcPath, destPath string) error {
-	srcFile, err := os.Open(srcPath)
-	if err != nil {
-		return fmt.Errorf("open input PDF: %w", err)
-	}
-	defer srcFile.Close()
-
-	srcStat, err := srcFile.Stat()
-	if err != nil {
-		return fmt.Errorf("stat input PDF: %w", err)
+	// Keep the mode of whatever the output replaces; otherwise use the mode
+	// os.Create would have given a fresh file.
+	mode := os.FileMode(0o644)
+	if st, statErr := os.Stat(destPath); statErr == nil {
+		mode = st.Mode()
 	}
 
 	tmpFile, err := os.CreateTemp(filepath.Dir(destPath), ".flashsign-*.pdf")
@@ -271,9 +241,9 @@ func (s *Signer) signInPlace(params SignParams, srcPath, destPath string) error 
 		return fmt.Errorf("create temp output PDF: %w", err)
 	}
 	tmpPath := tmpFile.Name()
-	cleanup := true
+	committed := false
 	defer func() {
-		if cleanup {
+		if !committed {
 			_ = tmpFile.Close()
 			_ = os.Remove(tmpPath)
 		}
@@ -282,20 +252,17 @@ func (s *Signer) signInPlace(params SignParams, srcPath, destPath string) error 
 	if err := s.SignStream(srcFile, tmpFile, params); err != nil {
 		return fmt.Errorf("sign PDF: %w", err)
 	}
-	if err := tmpFile.Sync(); err != nil {
-		return fmt.Errorf("sync temp output PDF: %w", err)
-	}
 	if err := tmpFile.Close(); err != nil {
 		return fmt.Errorf("close temp output PDF: %w", err)
 	}
-	if err := os.Chmod(tmpPath, srcStat.Mode()); err != nil {
+	if err := os.Chmod(tmpPath, mode); err != nil {
 		return fmt.Errorf("chmod temp output PDF: %w", err)
 	}
 	if err := os.Rename(tmpPath, destPath); err != nil {
 		return fmt.Errorf("replace destination PDF: %w", err)
 	}
 
-	cleanup = false
+	committed = true
 	return nil
 }
 
@@ -336,6 +303,13 @@ func prepareCompatSource(srcPath string) (preparedPath string, cleanup func(), e
 	return tmpPath, func() { _ = os.Remove(tmpPath) }, nil
 }
 
+// sourceUsesXRefStream reports whether the file's most recent cross-reference
+// section is an xref stream rather than a classic "xref" table: startxref
+// points at the literal keyword for a classic table and at an object header for
+// a stream. Hybrid-reference files keep a classic table and need no rewrite.
+//
+// Any failure to answer the question reports false, leaving the real diagnosis
+// to the parser rather than failing the sign here.
 func sourceUsesXRefStream(path string) (bool, error) {
 	f, err := os.Open(path)
 	if err != nil {
@@ -348,28 +322,33 @@ func sourceUsesXRefStream(path string) (bool, error) {
 		return false, err
 	}
 
-	const maxTail = 1 << 20 // 1MB
+	var tail [startxrefSearchWindow]byte
 	readSize := st.Size()
-	if readSize > maxTail {
-		readSize = maxTail
+	if readSize > int64(len(tail)) {
+		readSize = int64(len(tail))
 	}
-	start := st.Size() - readSize
-	if _, err := f.Seek(start, io.SeekStart); err != nil {
+	if readSize < int64(len(kwXref)) {
+		return false, nil
+	}
+	if _, err := f.ReadAt(tail[:readSize], st.Size()-readSize); err != nil && err != io.EOF {
 		return false, err
 	}
 
-	buf := make([]byte, readSize)
-	n, err := io.ReadFull(f, buf)
-	if err != nil && err != io.EOF && err != io.ErrUnexpectedEOF {
-		return false, err
+	offset, err := findStartxref(tail[:readSize])
+	if err != nil || offset <= 0 || offset > st.Size()-int64(len(kwXref)) {
+		return false, nil
 	}
-	buf = buf[:n]
 
-	return bytes.Contains(buf, []byte("/Type/XRef")) ||
-		bytes.Contains(buf, []byte("/Type /XRef")), nil
+	var head [4]byte
+	if _, err := f.ReadAt(head[:], offset); err != nil && err != io.EOF {
+		return false, nil
+	}
+	return !bytes.Equal(head[:], kwXref), nil
 }
 
 // SignAndEncrypt signs a PDF file and then encrypts it with AES.
+// Like Sign, the destination is replaced by renaming a fully written temporary
+// file over it.
 func (s *Signer) SignAndEncrypt(params SignParams, enc EncryptParams) error {
 	if enc.Password == "" {
 		return fmt.Errorf("EncryptParams.Password is required")
@@ -395,87 +374,68 @@ func (s *Signer) SignAndEncrypt(params SignParams, enc EncryptParams) error {
 		return fmt.Errorf("sign PDF: %w", err)
 	}
 
-	inPlace := sameFilePath(params.Src, destPath)
-	outPath := destPath
-	if inPlace {
-		tmpFile, err := os.CreateTemp(filepath.Dir(destPath), ".flashsign-enc-*.pdf")
-		if err != nil {
-			return fmt.Errorf("create temp output PDF: %w", err)
-		}
-		outPath = tmpFile.Name()
-		if err := tmpFile.Close(); err != nil {
-			return fmt.Errorf("close temp output PDF: %w", err)
-		}
-		defer os.Remove(outPath)
+	mode := os.FileMode(0o644)
+	if st, statErr := os.Stat(destPath); statErr == nil {
+		mode = st.Mode()
 	}
 
-	dstFile, err := os.Create(outPath)
+	tmpFile, err := os.CreateTemp(filepath.Dir(destPath), ".flashsign-enc-*.pdf")
 	if err != nil {
-		return fmt.Errorf("create output PDF: %w", err)
+		return fmt.Errorf("create temp output PDF: %w", err)
 	}
+	tmpPath := tmpFile.Name()
+	committed := false
+	defer func() {
+		if !committed {
+			_ = tmpFile.Close()
+			_ = os.Remove(tmpPath)
+		}
+	}()
 
-	signedReader := bytes.NewReader(signedData)
-	if err := encryptPDFStream(signedReader, dstFile, enc.Password, keyLength); err != nil {
-		_ = dstFile.Close()
+	if err := encryptPDFStream(bytes.NewReader(signedData), tmpFile, enc.Password, keyLength); err != nil {
 		return fmt.Errorf("encrypt PDF: %w", err)
 	}
-	if err := dstFile.Close(); err != nil {
-		return fmt.Errorf("close output PDF: %w", err)
+	if err := tmpFile.Close(); err != nil {
+		return fmt.Errorf("close temp output PDF: %w", err)
+	}
+	if err := os.Chmod(tmpPath, mode); err != nil {
+		return fmt.Errorf("chmod temp output PDF: %w", err)
+	}
+	if err := os.Rename(tmpPath, destPath); err != nil {
+		return fmt.Errorf("replace destination PDF: %w", err)
 	}
 
-	if inPlace {
-		srcInfo, err := os.Stat(params.Src)
-		if err == nil {
-			if chmodErr := os.Chmod(outPath, srcInfo.Mode()); chmodErr != nil {
-				return fmt.Errorf("chmod temp encrypted PDF: %w", chmodErr)
-			}
-		}
-		if err := os.Rename(outPath, destPath); err != nil {
-			return fmt.Errorf("replace destination PDF: %w", err)
-		}
-	}
-
+	committed = true
 	return nil
 }
 
-// SignBatch signs multiple PDFs concurrently.
+// SignBatch signs multiple PDFs concurrently, filling in each item's Result or
+// Err. Workers pull from a shared cursor so a slow document cannot stall the
+// others.
 func (s *Signer) SignBatch(items []BatchItem) {
 	workers := runtime.NumCPU()
 	if len(items) < workers {
 		workers = len(items)
 	}
-
-	var wg sync.WaitGroup
-	ch := make(chan int, len(items))
-
-	for i := range items {
-		ch <- i
+	if workers <= 0 {
+		return
 	}
-	close(ch)
 
+	var next atomic.Int64
+	var wg sync.WaitGroup
 	wg.Add(workers)
 	for w := 0; w < workers; w++ {
 		go func() {
 			defer wg.Done()
-			for idx := range ch {
-				result, err := s.SignBytes(items[idx].PDFData, items[idx].Params)
-				items[idx].Result = result
-				items[idx].Err = err
+			for {
+				i := int(next.Add(1)) - 1
+				if i >= len(items) {
+					return
+				}
+				items[i].Result, items[i].Err = s.SignBytes(items[i].PDFData, items[i].Params)
 			}
 		}()
 	}
 
 	wg.Wait()
-}
-
-func sameFilePath(a, b string) bool {
-	if a == "" || b == "" {
-		return false
-	}
-	absA, errA := filepath.Abs(a)
-	absB, errB := filepath.Abs(b)
-	if errA == nil && errB == nil {
-		return absA == absB
-	}
-	return filepath.Clean(a) == filepath.Clean(b)
 }

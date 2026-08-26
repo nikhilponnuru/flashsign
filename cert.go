@@ -120,15 +120,12 @@ func NewSigner(cfg Config) (*Signer, error) {
 	case *rsa.PrivateKey:
 		k.Precompute()
 		s.keyType = keyTypeRSA
-		s.sigMaxLen = k.Size() // key size in bytes = max signature size
 	case *ecdsa.PrivateKey:
 		switch k.Curve {
 		case elliptic.P256():
 			s.keyType = keyTypeECDSAP256
-			s.sigMaxLen = 72 // max DER-encoded ECDSA-P256 signature
 		case elliptic.P384():
 			s.keyType = keyTypeECDSAP384
-			s.sigMaxLen = 104 // max DER-encoded ECDSA-P384 signature
 		default:
 			return nil, fmt.Errorf("unsupported ECDSA curve: %v", k.Curve.Params().Name)
 		}

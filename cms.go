@@ -98,12 +98,6 @@ func appendDERSet(buf []byte, content []byte) []byte {
 	return append(buf, content...)
 }
 
-func appendDEROctetString(buf []byte, data []byte) []byte {
-	buf = append(buf, 0x04) // OCTET STRING tag
-	buf = appendDERLength(buf, len(data))
-	return append(buf, data...)
-}
-
 func appendDERContextTag(buf []byte, tag int, content []byte, constructed bool) []byte {
 	tagByte := byte(0x80 | tag) // context-specific
 	if constructed {
