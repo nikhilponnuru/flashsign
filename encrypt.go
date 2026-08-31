@@ -20,6 +20,11 @@ func newEncryptConf(password string, keyLength int) *model.Configuration {
 	}
 	conf := model.NewAESConfiguration(password, password, keyLength)
 	conf.Permissions = accessiblePermissions
+	// The encrypted document is signed afterwards by appending an increment,
+	// which needs its dictionaries readable: object streams would be encrypted
+	// wholesale, so write plain objects with a classic xref table.
+	conf.WriteObjectStream = false
+	conf.WriteXRefStream = false
 	conf.Optimize = false
 	conf.OptimizeBeforeWriting = false
 	conf.OptimizeResourceDicts = false

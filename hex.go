@@ -89,9 +89,11 @@ func appendInt64(buf []byte, n int64) []byte {
 	return strconv.AppendInt(buf, n, 10)
 }
 
-// appendFloat appends a float with minimal formatting to buf.
+// appendFloat appends a float with minimal formatting to buf. The 'f' format
+// is required: PDF real numbers do not allow exponent notation, which 'g'
+// would emit for magnitudes beyond ~1e6 or below ~1e-4.
 func appendFloat(buf []byte, f float64) []byte {
-	return strconv.AppendFloat(buf, f, 'g', -1, 64)
+	return strconv.AppendFloat(buf, f, 'f', -1, 64)
 }
 
 // appendPDFDate appends a PDF date string (D:YYYYMMDDHHmmSS+00'00') to buf.
@@ -111,7 +113,8 @@ func appendPDFDate(buf []byte, t time.Time) []byte {
 	return buf
 }
 
-// appendPDFEscaped appends s to buf, escaping \, (, ) for PDF string literals.
+// appendPDFEscaped appends s to buf, escaping delimiters and control characters
+// that have special meaning inside PDF string literals.
 // Zero allocations.
 func appendPDFEscaped(buf []byte, s string) []byte {
 	for i := 0; i < len(s); i++ {
@@ -122,6 +125,16 @@ func appendPDFEscaped(buf []byte, s string) []byte {
 			buf = append(buf, '\\', '(')
 		case ')':
 			buf = append(buf, '\\', ')')
+		case '\n':
+			buf = append(buf, '\\', 'n')
+		case '\r':
+			buf = append(buf, '\\', 'r')
+		case '\t':
+			buf = append(buf, '\\', 't')
+		case '\b':
+			buf = append(buf, '\\', 'b')
+		case '\f':
+			buf = append(buf, '\\', 'f')
 		default:
 			buf = append(buf, s[i])
 		}

@@ -256,7 +256,7 @@ func BenchmarkBuildIncrement(b *testing.B) {
 
 	bp := slicePool.Get().(*[]byte)
 	for i := 0; i < b.N; i++ {
-		incr, _, err := signer.buildIncrement(*bp, &pi, int64(len(basePDF)), "Test", "", "", rect, true, signingTime)
+		incr, _, err := signer.buildIncrement(*bp, &pi, int64(len(basePDF)), "Test", "", "", rect, true, signingTime, nil)
 		if err != nil {
 			b.Fatal(err)
 		}

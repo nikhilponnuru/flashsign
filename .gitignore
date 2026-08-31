@@ -2,7 +2,7 @@
 flashsign
 *.bin
 coverage.out
-
+local/
 # Config with credentials
 config.ini
 

@@ -21,7 +21,11 @@ var slicePool = sync.Pool{
 	},
 }
 
-func (s *Signer) buildIncrement(buf []byte, pi *pdfInfo, srcSize int64, reason, contact, location string, rect Rectangle, visible bool, signingTime time.Time) ([]byte, incrOffsets, error) {
+// buildIncrement writes the incremental update into buf. fc is non-nil when the
+// source document is encrypted: every string and stream the increment adds is
+// then encrypted with the file key, except the signature /Contents value,
+// which the spec leaves in the clear (PDF 32000-1 7.6.2).
+func (s *Signer) buildIncrement(buf []byte, pi *pdfInfo, srcSize int64, reason, contact, location string, rect Rectangle, visible bool, signingTime time.Time, fc *fileCrypt) ([]byte, incrOffsets, error) {
 	// Allocate object numbers.
 	sigValueObjNr := pi.nextObjNr
 	widgetObjNr := pi.nextObjNr + 1
@@ -36,10 +40,13 @@ func (s *Signer) buildIncrement(buf []byte, pi *pdfInfo, srcSize int64, reason, 
 	}
 
 	// Tagged (accessible) documents need /DisplayDocTitle plus /Tabs /S on the
-	// page that receives the signature widget. parsePDF has already classified
-	// /ViewerPreferences (see resolveViewerPrefs): -1 means leave untouched.
-	inlineViewerPrefs := pi.tagged && pi.viewerPrefsObjNr == 0
-	updateViewerPrefsObj := pi.tagged && pi.viewerPrefsObjNr > 0
+	// page that receives the signature widget. Match the Java signer by adding
+	// /DisplayDocTitle only when absent; an explicit producer setting is not
+	// changed as a side effect of signing. resolveViewerPrefs uses -1 for an
+	// unresolvable value that must be left untouched.
+	addDisplayDocTitle := pi.tagged && findTopLevelKey(pi.viewerPrefsRaw, "DisplayDocTitle") < 0
+	inlineViewerPrefs := addDisplayDocTitle && pi.viewerPrefsObjNr == 0
+	updateViewerPrefsObj := addDisplayDocTitle && pi.viewerPrefsObjNr > 0
 	addTabs := pi.tagged && !pi.pageHasTabs
 
 	buf = buf[:0]
@@ -85,42 +92,47 @@ func (s *Signer) buildIncrement(buf []byte, pi *pdfInfo, srcSize int64, reason, 
 	offsets.contentsHexEndIncr = len(buf)
 	buf = append(buf, ">\n"...)
 	if s.signerNameStr != "" {
-		buf = append(buf, "/Name ("...)
-		buf = appendPDFEscaped(buf, s.signerNameStr)
-		buf = append(buf, ")\n"...)
+		buf = append(buf, "/Name "...)
+		buf = appendPDFTextString(buf, s.signerNameStr, fc, sigValueObjNr, 0)
+		buf = append(buf, '\n')
 	}
 	if reason != "" {
-		buf = append(buf, "/Reason ("...)
-		buf = appendPDFEscaped(buf, reason)
-		buf = append(buf, ")\n"...)
+		buf = append(buf, "/Reason "...)
+		buf = appendPDFTextString(buf, reason, fc, sigValueObjNr, 0)
+		buf = append(buf, '\n')
 	}
 	if contact != "" {
-		buf = append(buf, "/ContactInfo ("...)
-		buf = appendPDFEscaped(buf, contact)
-		buf = append(buf, ")\n"...)
+		buf = append(buf, "/ContactInfo "...)
+		buf = appendPDFTextString(buf, contact, fc, sigValueObjNr, 0)
+		buf = append(buf, '\n')
 	}
 	if location != "" {
-		buf = append(buf, "/Location ("...)
-		buf = appendPDFEscaped(buf, location)
-		buf = append(buf, ")\n"...)
+		buf = append(buf, "/Location "...)
+		buf = appendPDFTextString(buf, location, fc, sigValueObjNr, 0)
+		buf = append(buf, '\n')
 	}
-	buf = append(buf, "/M ("...)
-	buf = appendPDFDate(buf, signingTime)
-	buf = append(buf, ")\n>>\nendobj\n\n"...)
+	var dateBuf [32]byte
+	buf = append(buf, "/M "...)
+	buf = appendPDFTextString(buf, string(appendPDFDate(dateBuf[:0], signingTime)), fc, sigValueObjNr, 0)
+	buf = append(buf, "\n>>\nendobj\n\n"...)
 
 	// === Widget Annotation ===
 	recordOffset(widgetObjNr, 0)
 	buf = appendObjHeader(buf, widgetObjNr, 0)
-	buf = append(buf, "\n/Type /Annot\n/Subtype /Widget\n/FT /Sig\n/T (Signature1)\n/V "...)
+	var nameBuf [24]byte
+	fieldName := appendInt(append(nameBuf[:0], "Signature"...), pi.signatureFieldNr)
+	buf = append(buf, "\n/Type /Annot\n/Subtype /Widget\n/FT /Sig\n/T "...)
+	buf = appendPDFTextString(buf, string(fieldName), fc, widgetObjNr, 0)
+	buf = append(buf, "\n/V "...)
 	buf = appendObjRef(buf, sigValueObjNr, 0)
 	buf = append(buf, "\n/F 132\n/P "...)
 	buf = appendObjRef(buf, pi.pageObjNr, pi.pageGen)
 	buf = append(buf, '\n')
 	if pi.tagged {
 		// Alternate field description for assistive technology (PDF/UA-1 7.18.6.2).
-		buf = append(buf, "/TU ("...)
-		buf = appendPDFEscaped(buf, signatureFieldDescription)
-		buf = append(buf, ")\n"...)
+		buf = append(buf, "/TU "...)
+		buf = appendPDFTextString(buf, signatureFieldDescription, fc, widgetObjNr, 0)
+		buf = append(buf, '\n')
 	}
 	if visible && rect.X1 != rect.X2 && rect.Y1 != rect.Y2 {
 		buf = append(buf, "/Rect ["...)
@@ -150,7 +162,11 @@ func (s *Signer) buildIncrement(buf []byte, pi *pdfInfo, srcSize int64, reason, 
 		// Font object.
 		recordOffset(fontObjNr, 0)
 		buf = appendInt(buf, fontObjNr)
-		buf = append(buf, " 0 obj\n<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /Encoding /WinAnsiEncoding >>\nendobj\n\n"...)
+		if s.appearance.bold {
+			buf = append(buf, " 0 obj\n<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica-Bold /Encoding /WinAnsiEncoding >>\nendobj\n\n"...)
+		} else {
+			buf = append(buf, " 0 obj\n<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /Encoding /WinAnsiEncoding >>\nendobj\n\n"...)
+		}
 
 		// Form XObject with placeholder /Length (patched after stream content).
 		recordOffset(appearanceObjNr, 0)
@@ -166,7 +182,11 @@ func (s *Signer) buildIncrement(buf []byte, pi *pdfInfo, srcSize int64, reason, 
 		buf = append(buf, "      "...) // 6-char placeholder
 		buf = append(buf, "\n>>\nstream\n"...)
 		streamStart := len(buf)
-		buf = appendAppearanceStream(buf, rect, s.signerNameStr, reason, location, signingTime)
+		buf = appendAppearanceStream(buf, rect, s.appearance, s.signerNameStr, reason, location, signingTime)
+		if fc != nil {
+			ct := fc.encryptBytes(appearanceObjNr, 0, buf[streamStart:])
+			buf = append(buf[:streamStart], ct...)
+		}
 		streamLen := len(buf) - streamStart
 		buf = append(buf, "\nendstream\nendobj\n\n"...)
 		// Patch /Length value in-place.
@@ -184,7 +204,15 @@ func (s *Signer) buildIncrement(buf []byte, pi *pdfInfo, srcSize int64, reason, 
 	} else {
 		buf = appendDictWithoutKey(buf, pi.catalogRaw, "AcroForm")
 	}
-	buf = append(buf, "\n/AcroForm << /Fields ["...)
+	buf = append(buf, "\n/AcroForm <<"...)
+	// Preserve all existing form-level behavior (/DR, /DA, /NeedAppearances,
+	// /CO, /XFA, and producer-specific entries). Only /Fields and /SigFlags
+	// need replacement to attach the new signature field and advertise that
+	// the document contains signatures.
+	if pi.acroFormRaw != nil {
+		buf = appendDictWithoutKeys2(buf, pi.acroFormRaw, "Fields", "SigFlags")
+	}
+	buf = append(buf, "\n/Fields ["...)
 	if len(pi.existingFields) > 0 {
 		buf = append(buf, ' ')
 		buf = append(buf, pi.existingFields...)
@@ -193,8 +221,8 @@ func (s *Signer) buildIncrement(buf []byte, pi *pdfInfo, srcSize int64, reason, 
 	buf = appendObjRef(buf, widgetObjNr, 0)
 	buf = append(buf, "] /SigFlags 3 >>"...)
 	if inlineViewerPrefs {
-		// Preserve existing viewer preferences (eg /Direction) and force
-		// /DisplayDocTitle true for tagged documents.
+		// Preserve existing viewer preferences (eg /Direction) and add the
+		// missing /DisplayDocTitle entry for tagged documents.
 		buf = append(buf, kwViewerPreferencesPrefix...)
 		buf = appendDictWithoutKey(buf, pi.viewerPrefsRaw, "DisplayDocTitle")
 		buf = append(buf, kwDisplayDocTitleTrue...)
@@ -272,6 +300,11 @@ func (s *Signer) buildIncrement(buf []byte, pi *pdfInfo, srcSize int64, reason, 
 		buf = append(buf, pi.idArray...)
 		buf = append(buf, '\n')
 	}
+	if len(pi.encryptRaw) > 0 {
+		buf = append(buf, "/Encrypt "...)
+		buf = append(buf, pi.encryptRaw...)
+		buf = append(buf, '\n')
+	}
 	buf = append(buf, "/Prev "...)
 	buf = appendInt64(buf, pi.prevXrefOffset)
 	buf = append(buf, "\n>>\nstartxref\n"...)
@@ -279,6 +312,23 @@ func (s *Signer) buildIncrement(buf []byte, pi *pdfInfo, srcSize int64, reason, 
 	buf = append(buf, "\n%%EOF\n"...)
 
 	return buf, offsets, nil
+}
+
+// appendPDFTextString writes s as a PDF string owned by object (objNr, gen):
+// an escaped literal for plain documents, or the AES ciphertext as a hex
+// string when the document is encrypted.
+func appendPDFTextString(buf []byte, s string, fc *fileCrypt, objNr, gen int) []byte {
+	if fc == nil {
+		buf = append(buf, '(')
+		buf = appendPDFEscaped(buf, s)
+		return append(buf, ')')
+	}
+	ct := fc.encryptBytes(objNr, gen, []byte(s))
+	buf = append(buf, '<')
+	for _, b := range ct {
+		buf = append(buf, upperHexChars[b>>4], upperHexChars[b&0x0F])
+	}
+	return append(buf, '>')
 }
 
 // appendDictWithoutKey copies raw dict content to buf, removing the specified
@@ -323,17 +373,13 @@ func appendDictWithoutKeys2(buf []byte, raw []byte, keyA, keyB string) []byte {
 
 // dictKeyRange returns the byte range [entryStart, valueEnd) covering a
 // top-level /Key plus its value inside raw dict content, or (-1, -1) when the
-// key is absent. entryStart includes whitespace preceding the key.
+// key is absent. Whitespace preceding the key is left in place: it is harmless
+// inside a dictionary, and it may be the line ending that terminates a
+// %-comment before the key.
 func dictKeyRange(raw []byte, key string) (int, int) {
 	pos := findTopLevelKey(raw, key)
 	if pos < 0 {
 		return -1, -1
-	}
-
-	// Find the start of this entry (trim preceding newline/space).
-	entryStart := pos
-	for entryStart > 0 && isSpace(raw[entryStart-1]) {
-		entryStart--
 	}
 
 	// Skip past the key and any whitespace before the value.
@@ -342,7 +388,7 @@ func dictKeyRange(raw []byte, key string) (int, int) {
 		keyEnd++
 	}
 
-	return entryStart, findValueEnd(raw, keyEnd)
+	return pos, findValueEnd(raw, keyEnd)
 }
 
 // resolveParams merges per-document SignParams with the Config defaults.

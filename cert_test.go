@@ -1,10 +1,16 @@
 package flashsign
 
 import (
+	"crypto/rand"
+	"crypto/rsa"
+	"crypto/x509"
+	"encoding/pem"
 	"os"
 	"path/filepath"
 	"testing"
 	"time"
+
+	pkcs12 "software.sslmate.com/src/go-pkcs12"
 )
 
 func TestNewSignerFromPFX(t *testing.T) {
@@ -17,6 +23,56 @@ func TestNewSignerFromPFX(t *testing.T) {
 	}
 	if signer.keyType != keyTypeRSA {
 		t.Fatalf("expected RSA key type, got %d", signer.keyType)
+	}
+}
+
+func TestNewSignerFromPFXKeepsCertificateChain(t *testing.T) {
+	pfxData, err := os.ReadFile(filepath.Join("testdata", "test.pfx"))
+	if err != nil {
+		t.Fatalf("read PFX: %v", err)
+	}
+	key, cert, _, err := pkcs12.DecodeChain(pfxData, testPFXPassword)
+	if err != nil {
+		t.Fatalf("decode fixture PFX: %v", err)
+	}
+	withChain, err := pkcs12.LegacyRC2.Encode(key, cert, []*x509.Certificate{cert}, testPFXPassword)
+	if err != nil {
+		t.Fatalf("encode chained PFX: %v", err)
+	}
+	path := filepath.Join(t.TempDir(), "chain.pfx")
+	if err := os.WriteFile(path, withChain, 0o600); err != nil {
+		t.Fatalf("write chained PFX: %v", err)
+	}
+
+	signer, err := NewSignerFromPFX(path, testPFXPassword)
+	if err != nil {
+		t.Fatalf("NewSignerFromPFX: %v", err)
+	}
+	if got := len(signer.cfg.Chain); got != 2 {
+		t.Fatalf("certificate chain length = %d, want 2", got)
+	}
+}
+
+func TestNewSignerRejectsNilAndMismatchedCertificate(t *testing.T) {
+	certPEM, err := os.ReadFile(filepath.Join("testdata", "test-cert.pem"))
+	if err != nil {
+		t.Fatalf("read certificate: %v", err)
+	}
+	block, _ := pem.Decode(certPEM)
+	cert, err := x509.ParseCertificate(block.Bytes)
+	if err != nil {
+		t.Fatalf("parse certificate: %v", err)
+	}
+	if _, err := NewSigner(Config{Key: &rsa.PrivateKey{}, Chain: []*x509.Certificate{nil}}); err == nil {
+		t.Fatal("NewSigner accepted a nil signer certificate")
+	}
+
+	other, err := rsa.GenerateKey(rand.Reader, 2048)
+	if err != nil {
+		t.Fatalf("generate mismatched key: %v", err)
+	}
+	if _, err := NewSigner(Config{Key: other, Chain: []*x509.Certificate{cert}}); err == nil {
+		t.Fatal("NewSigner accepted a private key that does not match the signer certificate")
 	}
 }
 

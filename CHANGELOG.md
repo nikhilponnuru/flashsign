@@ -9,6 +9,38 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- `SignAndEncrypt` now encrypts first and signs the encrypted document, so the
+  signature covers the final bytes and verifies — the same outcome as the Java
+  signer's single encrypt-and-sign stamper pass. Previously the document was
+  signed and then rewritten by the encryptor, which invalidated the signature.
+  The increment's strings and appearance stream are AES-encrypted with the file
+  key derived from the password (`crypt.go`); a wrong password is rejected.
+- CMS signed attributes are emitted in DER `SET OF` order (contentType,
+  signingTime, messageDigest). Sorting by OID alone produced a value strict
+  verifiers rejected.
+- Signing never rewrites the source any more. The pdfcpu "compatibility
+  rewrite" for xref-stream sources is gone: the parser now handles PNG
+  predictors in xref/object streams, free entries, and hybrid-reference files
+  (`/XRefStm`), so every source is signed as a pure append with the original
+  bytes preserved verbatim.
+- The visible signature appearance matches the Java signer's OpenPDF layer-2
+  output byte-for-byte in layout: transparent background, 9pt Helvetica in
+  rgb(16,181,60), lines `Digitally signed by <name>` / `Date: yyyy.MM.dd
+  HH:mm:ss z` / `Reason:` / `Location:` laid out from the bottom of the box up
+  to 70% of its height with lines that do not fit dropped, as OpenPDF does. The
+  earlier yellow filled box with a border is gone. The text style is
+  configurable via `Config.Appearance` (`font_size`, `font_bold`, `font_color`
+  in `config.ini`); the defaults reproduce the Java signer.
+- Existing `/AcroForm` entries (`/DR`, `/DA`, `/NeedAppearances`, …) are
+  preserved when the signature field is added; a document signed more than once
+  gets `Signature2`, `Signature3`, … instead of a duplicate field name.
+- `/DisplayDocTitle` is only added when absent, matching the Java signer; an
+  explicit producer value is no longer overridden.
+- PFX loading keeps the full certificate chain, and `NewSigner` rejects a
+  private key that does not match the signer certificate.
+- Real numbers are written in plain decimal notation; large or tiny
+  coordinates no longer produce exponent notation, which PDF does not allow.
+
 - Rewritten objects now keep their own generation number. The increment builder
   hard-coded generation 0 in object headers, xref entries and the trailer's
   `/Root` and `/Info` references, so signing a PDF whose catalog, signature page
@@ -32,6 +64,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Output files inherit the source file's permission bits (falling back to
+  0600) instead of a fixed 0644, so signing never widens a private document's
+  readability.
+- The server's concurrency limit can be set with `max_concurrent` in
+  `config.ini` (previously only the `-max-concurrent` flag, and fixed at
+  `NumCPU*2` when started without arguments).
+- `SignAndEncrypt` rejects `%PDF-2.0` sources with a clear error: pdfcpu
+  encrypts those with R6 (ISO 32000-2) hashing, which is not implemented. The
+  Java signer only ever produced R4/AES-128.
 - `SignStream` reads the source once into a pooled buffer instead of reading it
   whole for parsing and then streaming over it twice more to hash and to copy.
   Memory per operation drops 83–99.96% (5MB PDF, 14 cores: 5.0MB → 2.0KB) and

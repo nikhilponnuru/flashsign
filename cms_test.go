@@ -117,7 +117,11 @@ func TestDigestAlgorithmMatchesP384(t *testing.T) {
 		t.Fatalf("generate ECDSA P-384 key: %v", err)
 	}
 
-	template := &x509.Certificate{SerialNumber: mustBigInt("123457")}
+	template := &x509.Certificate{
+		SerialNumber: mustBigInt("123457"),
+		NotBefore:    time.Now().Add(-time.Hour),
+		NotAfter:     time.Now().Add(time.Hour),
+	}
 	template.Subject.CommonName = "ECDSA P384 Test"
 	certDER, err := x509.CreateCertificate(rand.Reader, template, template, &ecKey.PublicKey, ecKey)
 	if err != nil {
@@ -139,4 +143,10 @@ func TestDigestAlgorithmMatchesP384(t *testing.T) {
 	if !bytes.Contains(signer.digestAlgDER, derOIDSHA384) {
 		t.Fatal("P-384 signer digest algorithm is not SHA-384")
 	}
+
+	signed, err := signer.SignBytes(buildSinglePagePDF(2048), SignParams{})
+	if err != nil {
+		t.Fatalf("sign P-384 PDF: %v", err)
+	}
+	verifyDetachedSignature(t, signed)
 }

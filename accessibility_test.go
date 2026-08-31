@@ -278,7 +278,7 @@ func TestSignTaggedPDFViaMarkInfoOnly(t *testing.T) {
 	validateWithPDFCPU(t, out)
 }
 
-func TestSignTaggedPDFForcesDisplayDocTitleTrue(t *testing.T) {
+func TestSignTaggedPDFPreservesExplicitDisplayDocTitle(t *testing.T) {
 	signer := newGeneratedSigner(t)
 	in := buildTestPDF(t, testPDFOpts{
 		tagged:      true,
@@ -292,8 +292,8 @@ func TestSignTaggedPDFForcesDisplayDocTitleTrue(t *testing.T) {
 	incr := increment(t, in, out)
 
 	mustCount(t, incr, "/DisplayDocTitle", 1, "catalog")
-	mustContain(t, incr, "/DisplayDocTitle true", "catalog")
-	mustNotContain(t, incr, "/DisplayDocTitle false", "catalog")
+	mustContain(t, incr, "/DisplayDocTitle false", "catalog")
+	mustNotContain(t, incr, "/DisplayDocTitle true", "catalog")
 	// Other viewer preferences survive the rewrite.
 	mustContain(t, incr, "/Direction /L2R", "catalog")
 	mustContain(t, incr, "/FitWindow true", "catalog")
@@ -397,7 +397,7 @@ func TestSignVisibleOnTaggedPDF(t *testing.T) {
 	// Visible signature behaviour is unchanged.
 	mustContain(t, incr, "/Rect [0 550 278 609]", "signature widget")
 	mustContain(t, incr, "/AP << /N ", "signature widget")
-	mustContain(t, incr, "Digitally signed by:", "appearance stream")
+	mustContain(t, incr, "Digitally signed by ", "appearance stream")
 	mustContain(t, incr, "/Reason (Regulatory)", "signature dict")
 
 	// Accessibility entries still applied.
@@ -640,6 +640,9 @@ func TestSignStructTreeRootNullIsUntagged(t *testing.T) {
 
 // --- unit tests for the dict splicing / detection helpers ------------------
 
+// Whitespace before a removed key is deliberately left in place (it is
+// insignificant inside a dictionary and may terminate a %-comment), so the
+// expected strings carry the leftover blanks.
 func TestAppendDictWithoutKeys2(t *testing.T) {
 	tests := []struct {
 		name string
@@ -649,12 +652,12 @@ func TestAppendDictWithoutKeys2(t *testing.T) {
 		{
 			name: "both keys present",
 			raw:  "/Type /Catalog /AcroForm << /Fields [1 0 R] >> /Lang (en) /ViewerPreferences << /Direction /L2R >> /Pages 2 0 R",
-			want: "/Type /Catalog /Lang (en) /Pages 2 0 R",
+			want: "/Type /Catalog  /Lang (en)  /Pages 2 0 R",
 		},
 		{
 			name: "reverse order",
 			raw:  "/ViewerPreferences << /Direction /L2R >> /Lang (en) /AcroForm 9 0 R /Pages 2 0 R",
-			want: " /Lang (en) /Pages 2 0 R",
+			want: " /Lang (en)  /Pages 2 0 R",
 		},
 		{
 			name: "only first key present",
@@ -664,7 +667,7 @@ func TestAppendDictWithoutKeys2(t *testing.T) {
 		{
 			name: "only second key present",
 			raw:  "/Pages 2 0 R /ViewerPreferences << /Direction /L2R >>",
-			want: "/Pages 2 0 R",
+			want: "/Pages 2 0 R ",
 		},
 		{
 			name: "neither key present",
@@ -679,7 +682,7 @@ func TestAppendDictWithoutKeys2(t *testing.T) {
 		{
 			name: "pretty printed values",
 			raw:  "/Type /Catalog\n/AcroForm\n<< /Fields [] >>\n/ViewerPreferences\n<< /Direction /L2R >>\n/Pages 2 0 R",
-			want: "/Type /Catalog\n/Pages 2 0 R",
+			want: "/Type /Catalog\n\n\n/Pages 2 0 R",
 		},
 	}
 
@@ -698,7 +701,7 @@ func TestAppendDictWithoutKeyPrettyPrinted(t *testing.T) {
 	// otherwise the orphaned dict value would corrupt the rewritten object.
 	raw := "/Type /Page\n/Annots\n[6 0 R]\n/Contents 5 0 R"
 	got := string(appendDictWithoutKey(nil, []byte(raw), "Annots"))
-	want := "/Type /Page\n/Contents 5 0 R"
+	want := "/Type /Page\n\n/Contents 5 0 R"
 	if got != want {
 		t.Errorf("appendDictWithoutKey()\n got: %q\nwant: %q", got, want)
 	}
@@ -764,9 +767,10 @@ func TestParsePDFAccessibilityDetection(t *testing.T) {
 }
 
 // TestSignTaggedXRefStreamPDF covers a tagged source whose catalog and pages
-// live in object streams behind an xref stream: signing goes through the
-// pdfcpu compatibility rewrite, and the accessibility entries must still be
-// applied to the (re-numbered) catalog and signature page.
+// live in object streams behind an xref stream: the parser resolves them out
+// of the compressed streams, the source is signed as-is (never rewritten), and
+// the accessibility entries must still be applied to the catalog and
+// signature page in the appended increment.
 func TestSignTaggedXRefStreamPDF(t *testing.T) {
 	dir := t.TempDir()
 	srcPath := filepath.Join(dir, "tagged-xrefstream.pdf")
@@ -805,12 +809,18 @@ func TestSignTaggedXRefStreamPDF(t *testing.T) {
 	mustContain(t, out, "/DisplayDocTitle true", "catalog")
 	mustContain(t, out, "/Direction/L2R", "catalog")
 	mustContain(t, out, "/StructTreeRoot", "catalog")
-	mustContain(t, out, "/Tabs/S", "pages")
+	mustContain(t, out, "/Tabs /S", "signature page")
 	mustContain(t, out, "/TU (Digital signature)", "signature widget")
 	mustContain(t, out, "/Rect [0 550 278 609]", "signature widget")
-	// Signature page /Tabs plus the fixture page that already had one.
-	mustCount(t, out, "/Tabs", 2, "pages")
+	// Only the signature page's /Tabs is visible in the raw bytes: the other
+	// page keeps its own inside a compressed object stream, untouched.
+	mustCount(t, out, "/Tabs", 1, "signature page")
 	mustCount(t, out, "/DisplayDocTitle", 1, "catalog")
+
+	// The source must survive verbatim: signing appends, never rewrites.
+	if !bytes.HasPrefix(out, compact.Bytes()) {
+		t.Error("signed output does not start with the source bytes verbatim")
+	}
 
 	validateWithPDFCPU(t, out)
 }

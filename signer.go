@@ -13,9 +13,6 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
-
-	"github.com/pdfcpu/pdfcpu/pkg/api"
-	"github.com/pdfcpu/pdfcpu/pkg/pdfcpu/model"
 )
 
 // hashPoolSHA256 provides reusable SHA-256 hash instances.
@@ -59,10 +56,12 @@ type pendingSignature struct {
 
 // prepareIncrement parses the PDF and builds its incremental update, with
 // /ByteRange already patched to the offsets the finished document will have.
+// password is the user password of an encrypted source (empty for a plain
+// one); an encrypted source without a password is rejected.
 //
 // buf is non-nil on every return, error paths included, and the caller must
 // hand it back to slicePool.
-func (s *Signer) prepareIncrement(pdfData []byte, params SignParams) (pendingSignature, error) {
+func (s *Signer) prepareIncrement(pdfData []byte, params SignParams, password string) (pendingSignature, error) {
 	reason, contact, location, page, rect, visible := s.resolveParams(params)
 	srcSize := int64(len(pdfData))
 
@@ -72,12 +71,21 @@ func (s *Signer) prepareIncrement(pdfData []byte, params SignParams) (pendingSig
 	}
 
 	// Parse PDF structure using the custom parser (no pdfcpu).
-	pi, err := parsePDF(pdfData, page)
+	pi, err := parsePDFAny(pdfData, page)
 	if err != nil {
 		return p, err
 	}
+	var fc *fileCrypt
+	if pi.encryptRaw != nil {
+		if password == "" {
+			return p, fmt.Errorf("PDF is encrypted; decrypt it before signing")
+		}
+		if fc, err = newFileCrypt(password, pi.encryptDictRaw, pi.idFirst); err != nil {
+			return p, fmt.Errorf("encrypted PDF: %w", err)
+		}
+	}
 
-	p.incr, p.offsets, err = s.buildIncrement(*p.buf, &pi, srcSize, reason, contact, location, rect, visible, p.signingTime)
+	p.incr, p.offsets, err = s.buildIncrement(*p.buf, &pi, srcSize, reason, contact, location, rect, visible, p.signingTime, fc)
 	*p.buf = p.incr
 	if err != nil {
 		return p, err
@@ -121,8 +129,17 @@ func (s *Signer) signInto(head, incr []byte, offsets incrOffsets, signingTime ti
 }
 
 // SignBytes signs PDF bytes in memory and returns the signed PDF bytes.
+// The source is never rewritten: the result is the input bytes verbatim
+// followed by the signature's incremental update. A source whose latest
+// cross-reference section is an xref stream is signed as-is, with a classic
+// xref table appended in the increment.
 func (s *Signer) SignBytes(pdfData []byte, params SignParams) ([]byte, error) {
-	p, err := s.prepareIncrement(pdfData, params)
+	return s.signBytes(pdfData, params, "")
+}
+
+// signBytes is SignBytes for a source that may be encrypted with password.
+func (s *Signer) signBytes(pdfData []byte, params SignParams, password string) ([]byte, error) {
+	p, err := s.prepareIncrement(pdfData, params, password)
 	if err != nil {
 		slicePool.Put(p.buf)
 		return nil, err
@@ -158,7 +175,7 @@ const maxPooledSrcBuf = 8 << 20
 // SignStream signs a PDF by reading from src and writing the signed PDF to dst.
 // Unlike SignBytes it never allocates a buffer holding both the source and the
 // signed output; src is read once into a pooled buffer and written straight
-// through to dst.
+// through to dst. Like SignBytes, it never rewrites the source document.
 func (s *Signer) SignStream(src io.ReadSeeker, dst io.Writer, params SignParams) error {
 	srcSize, err := src.Seek(0, io.SeekEnd)
 	if err != nil {
@@ -186,7 +203,7 @@ func (s *Signer) SignStream(src io.ReadSeeker, dst io.Writer, params SignParams)
 		return fmt.Errorf("read source: %w", err)
 	}
 
-	p, err := s.prepareIncrement(data, params)
+	p, err := s.prepareIncrement(data, params, "")
 	defer slicePool.Put(p.buf)
 	if err != nil {
 		return err
@@ -205,11 +222,13 @@ func (s *Signer) SignStream(src io.ReadSeeker, dst io.Writer, params SignParams)
 }
 
 // Sign signs a PDF file and writes the result to the destination path.
-// Output is staged in a temporary file and renamed over the destination, so a
-// failure never leaves a truncated or unsigned file behind and readers only
-// ever see the old or the new document. The rename is not fsynced, so contents
-// are not guaranteed durable across a power loss. Signing in place
-// (Dest == Src, or an empty Dest) is supported.
+// The source document is never rewritten: signing appends an incremental
+// update, so the output contains the original bytes verbatim followed by the
+// signature objects. Output is staged in a temporary file and renamed over the
+// destination, so a failure never leaves a truncated or unsigned file behind
+// and readers only ever see the old or the new document. The rename is not
+// fsynced, so contents are not guaranteed durable across a power loss. Signing
+// in place (Dest == Src, or an empty Dest) is supported.
 func (s *Signer) Sign(params SignParams) error {
 	srcPath := params.Src
 	destPath := params.Dest
@@ -217,23 +236,21 @@ func (s *Signer) Sign(params SignParams) error {
 		destPath = srcPath
 	}
 
-	preparedSrcPath, cleanupPreparedSrc, err := prepareCompatSource(srcPath)
-	if err != nil {
-		return fmt.Errorf("prepare source PDF: %w", err)
-	}
-	defer cleanupPreparedSrc()
-
-	srcFile, err := os.Open(preparedSrcPath)
+	srcFile, err := os.Open(srcPath)
 	if err != nil {
 		return fmt.Errorf("open input PDF: %w", err)
 	}
 	defer srcFile.Close()
 
-	// Keep the mode of whatever the output replaces; otherwise use the mode
-	// os.Create would have given a fresh file.
-	mode := os.FileMode(0o644)
+	// Keep the source's permissions for a new output and the destination's
+	// permissions when replacing one. Do not make a private input PDF more
+	// broadly readable merely because it was signed.
+	mode := os.FileMode(0o600)
+	if st, statErr := srcFile.Stat(); statErr == nil {
+		mode = st.Mode().Perm()
+	}
 	if st, statErr := os.Stat(destPath); statErr == nil {
-		mode = st.Mode()
+		mode = st.Mode().Perm()
 	}
 
 	tmpFile, err := os.CreateTemp(filepath.Dir(destPath), ".flashsign-*.pdf")
@@ -266,89 +283,10 @@ func (s *Signer) Sign(params SignParams) error {
 	return nil
 }
 
-func prepareCompatSource(srcPath string) (preparedPath string, cleanup func(), err error) {
-	hasXRefStream, err := sourceUsesXRefStream(srcPath)
-	if err != nil {
-		return "", nil, err
-	}
-	if !hasXRefStream {
-		return srcPath, func() {}, nil
-	}
-
-	tmpFile, err := os.CreateTemp(filepath.Dir(srcPath), ".flashsign-srcnorm-*.pdf")
-	if err != nil {
-		return "", nil, err
-	}
-	tmpPath := tmpFile.Name()
-	if err := tmpFile.Close(); err != nil {
-		_ = os.Remove(tmpPath)
-		return "", nil, err
-	}
-
-	// Rewrite to classic xref sections for better compatibility with strict viewers.
-	conf := model.NewDefaultConfiguration()
-	conf.ValidationMode = model.ValidationRelaxed
-	conf.WriteObjectStream = false
-	conf.WriteXRefStream = false
-	conf.Optimize = false
-	conf.OptimizeBeforeWriting = false
-	conf.OptimizeResourceDicts = false
-	conf.ValidateLinks = false
-
-	if err := api.OptimizeFile(srcPath, tmpPath, conf); err != nil {
-		_ = os.Remove(tmpPath)
-		return "", nil, err
-	}
-
-	return tmpPath, func() { _ = os.Remove(tmpPath) }, nil
-}
-
-// sourceUsesXRefStream reports whether the file's most recent cross-reference
-// section is an xref stream rather than a classic "xref" table: startxref
-// points at the literal keyword for a classic table and at an object header for
-// a stream. Hybrid-reference files keep a classic table and need no rewrite.
-//
-// Any failure to answer the question reports false, leaving the real diagnosis
-// to the parser rather than failing the sign here.
-func sourceUsesXRefStream(path string) (bool, error) {
-	f, err := os.Open(path)
-	if err != nil {
-		return false, err
-	}
-	defer f.Close()
-
-	st, err := f.Stat()
-	if err != nil {
-		return false, err
-	}
-
-	var tail [startxrefSearchWindow]byte
-	readSize := st.Size()
-	if readSize > int64(len(tail)) {
-		readSize = int64(len(tail))
-	}
-	if readSize < int64(len(kwXref)) {
-		return false, nil
-	}
-	if _, err := f.ReadAt(tail[:readSize], st.Size()-readSize); err != nil && err != io.EOF {
-		return false, err
-	}
-
-	offset, err := findStartxref(tail[:readSize])
-	if err != nil || offset <= 0 || offset > st.Size()-int64(len(kwXref)) {
-		return false, nil
-	}
-
-	var head [4]byte
-	if _, err := f.ReadAt(head[:], offset); err != nil && err != io.EOF {
-		return false, nil
-	}
-	return !bytes.Equal(head[:], kwXref), nil
-}
-
-// SignAndEncrypt signs a PDF file and then encrypts it with AES.
-// Like Sign, the destination is replaced by renaming a fully written temporary
-// file over it.
+// SignAndEncrypt encrypts a PDF file with AES and signs the encrypted result,
+// so the signature covers the final bytes and stays valid — the same outcome
+// as the Java signer's single encrypt-and-sign stamper pass. Like Sign, the
+// destination is replaced by renaming a fully written temporary file over it.
 func (s *Signer) SignAndEncrypt(params SignParams, enc EncryptParams) error {
 	if enc.Password == "" {
 		return fmt.Errorf("EncryptParams.Password is required")
@@ -369,14 +307,23 @@ func (s *Signer) SignAndEncrypt(params SignParams, enc EncryptParams) error {
 		keyLength = 256
 	}
 
-	signedData, err := s.SignBytes(pdfData, params)
+	var encrypted bytes.Buffer
+	encrypted.Grow(len(pdfData) + 4096)
+	if err := encryptPDFStream(bytes.NewReader(pdfData), &encrypted, enc.Password, keyLength); err != nil {
+		return fmt.Errorf("encrypt PDF: %w", err)
+	}
+
+	signedData, err := s.signBytes(encrypted.Bytes(), params, enc.Password)
 	if err != nil {
 		return fmt.Errorf("sign PDF: %w", err)
 	}
 
-	mode := os.FileMode(0o644)
+	mode := os.FileMode(0o600)
+	if st, statErr := os.Stat(params.Src); statErr == nil {
+		mode = st.Mode().Perm()
+	}
 	if st, statErr := os.Stat(destPath); statErr == nil {
-		mode = st.Mode()
+		mode = st.Mode().Perm()
 	}
 
 	tmpFile, err := os.CreateTemp(filepath.Dir(destPath), ".flashsign-enc-*.pdf")
@@ -392,8 +339,8 @@ func (s *Signer) SignAndEncrypt(params SignParams, enc EncryptParams) error {
 		}
 	}()
 
-	if err := encryptPDFStream(bytes.NewReader(signedData), tmpFile, enc.Password, keyLength); err != nil {
-		return fmt.Errorf("encrypt PDF: %w", err)
+	if _, err := tmpFile.Write(signedData); err != nil {
+		return fmt.Errorf("write output PDF: %w", err)
 	}
 	if err := tmpFile.Close(); err != nil {
 		return fmt.Errorf("close temp output PDF: %w", err)

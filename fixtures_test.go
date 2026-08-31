@@ -183,7 +183,7 @@ func ensurePDFFixtures() error {
 	}
 
 	// A PDF whose catalog and pages live in object streams behind an xref
-	// stream, exercising the pdfcpu compatibility rewrite path.
+	// stream, exercising the parser's compressed-object resolution.
 	return writeIfMissing("xrefstream-sample.pdf", func() ([]byte, error) {
 		conf := model.NewDefaultConfiguration()
 		conf.ValidationMode = model.ValidationRelaxed

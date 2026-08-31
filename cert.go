@@ -11,7 +11,6 @@ import (
 	"os"
 	"time"
 
-	"golang.org/x/crypto/pkcs12"
 	pkcs12modern "software.sslmate.com/src/go-pkcs12"
 )
 
@@ -22,26 +21,18 @@ func NewSignerFromPFX(pfxPath string, password string) (*Signer, error) {
 		return nil, fmt.Errorf("read pfx file: %w", err)
 	}
 
-	key, cert, err := pkcs12.Decode(pfxData, password)
+	key, cert, caCerts, err := pkcs12modern.DecodeChain(pfxData, password)
 	if err != nil {
-		fallbackKey, fallbackCert, caCerts, fallbackErr := pkcs12modern.DecodeChain(pfxData, password)
-		if fallbackErr != nil {
-			return nil, fmt.Errorf("decode pfx: %w", err)
-		}
-
-		chain := make([]*x509.Certificate, 0, 1+len(caCerts))
-		chain = append(chain, fallbackCert)
-		chain = append(chain, caCerts...)
-
-		return NewSigner(Config{
-			Key:   fallbackKey,
-			Chain: chain,
-		})
+		return nil, fmt.Errorf("decode pfx: %w", err)
 	}
+
+	chain := make([]*x509.Certificate, 0, 1+len(caCerts))
+	chain = append(chain, cert)
+	chain = append(chain, caCerts...)
 
 	return NewSigner(Config{
 		Key:   key,
-		Chain: []*x509.Certificate{cert},
+		Chain: chain,
 	})
 }
 
@@ -112,15 +103,43 @@ func NewSigner(cfg Config) (*Signer, error) {
 	if len(cfg.Chain) == 0 {
 		return nil, fmt.Errorf("certificate chain must contain at least one certificate")
 	}
+	if cfg.Chain[0] == nil {
+		return nil, fmt.Errorf("signer certificate must not be nil")
+	}
 
 	s := &Signer{cfg: cfg}
+	if err := s.SetAppearance(cfg.Appearance); err != nil {
+		return nil, err
+	}
 
 	// Detect key type and set parameters.
 	switch k := cfg.Key.(type) {
 	case *rsa.PrivateKey:
+		if err := k.Validate(); err != nil {
+			return nil, fmt.Errorf("invalid RSA private key: %w", err)
+		}
+		certKey, ok := cfg.Chain[0].PublicKey.(*rsa.PublicKey)
+		if !ok || !certKey.Equal(&k.PublicKey) {
+			return nil, fmt.Errorf("private key does not match signer certificate")
+		}
 		k.Precompute()
 		s.keyType = keyTypeRSA
 	case *ecdsa.PrivateKey:
+		// ECDH() validates the key constant-time, rejecting an out-of-range
+		// scalar; its derived public key comes from the scalar itself, so
+		// comparing it against the certificate also catches stale X/Y fields.
+		ek, err := k.ECDH()
+		if err != nil {
+			return nil, fmt.Errorf("invalid ECDSA private key: %w", err)
+		}
+		certKey, ok := cfg.Chain[0].PublicKey.(*ecdsa.PublicKey)
+		if !ok {
+			return nil, fmt.Errorf("private key does not match signer certificate")
+		}
+		certEK, err := certKey.ECDH()
+		if err != nil || !ek.PublicKey().Equal(certEK) {
+			return nil, fmt.Errorf("private key does not match signer certificate")
+		}
 		switch k.Curve {
 		case elliptic.P256():
 			s.keyType = keyTypeECDSAP256
@@ -194,4 +213,16 @@ func (s *Signer) initContentsPlaceholder() {
 	}
 
 	s.contentsZeros = bytes.Repeat([]byte("0"), s.contentsPlaceholderLen)
+}
+
+// SetAppearance changes the visible signature text style. Call it before the
+// signer is shared between goroutines; NewSignerFromPFX and NewSignerFromPEM
+// use the default (Java signer) style.
+func (s *Signer) SetAppearance(a Appearance) error {
+	st, err := resolveAppearance(a)
+	if err != nil {
+		return err
+	}
+	s.appearance = st
+	return nil
 }

@@ -4,7 +4,8 @@
 [![Go Reference](https://pkg.go.dev/badge/github.com/nikhilponnuru/flashsign.svg)](https://pkg.go.dev/github.com/nikhilponnuru/flashsign)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 
-High-performance PDF digital signing library and CLI in Go, built as a drop-in replacement for Java-based PDF signing services — with near-zero allocations on the signing path.
+High-performance PDF digital signing library and CLI in Go, built as a Go port
+of the core jpdfsigner workflow with near-zero allocations on the signing path.
 
 ## Features
 
@@ -18,7 +19,7 @@ High-performance PDF digital signing library and CLI in Go, built as a drop-in r
 - Near-zero-allocation signing (5 allocs/op RSA at any PDF size, 0 allocs for parser and increment builder)
 - Pooled CMS scratch buffers and xref maps for minimal GC pressure
 - Concurrent batch signing
-- Streaming and in-memory signing APIs (streaming holds no per-size heap: 2KB/op on a 5MB PDF)
+- Streaming-I/O and in-memory signing APIs (`SignStream` reuses one source-sized buffer and avoids a combined source+output allocation)
 - Atomic file output — a failed sign never leaves a truncated or unsigned file
 - Production-hardened HTTP server (graceful shutdown, concurrency limiter, health endpoint)
 
@@ -74,7 +75,7 @@ The server provides:
 - `POST /sign` — sign (and optionally encrypt) a PDF
 - `GET /health` — returns `200 ok` (for load balancer health checks)
 - Graceful shutdown on SIGINT/SIGTERM (10s drain)
-- Concurrency limiter (default: `NumCPU*2`, configurable via `-max-concurrent`)
+- Concurrency limiter (default: `NumCPU*2`, configurable via `-max-concurrent` or `max_concurrent` in config.ini)
 - Request body size limit (1MB)
 
 `/sign` request contract:
@@ -157,6 +158,25 @@ cert=cert.pem
 key=key.pem
 ```
 
+### Visible signature appearance
+
+The text in the signature box reproduces what jpdfsigner (OpenPDF) draws:
+`Digitally signed by <certificate CN>`, `Date: yyyy.MM.dd HH:mm:ss z` (local
+time zone), `Reason: …`, `Location: …`, laid out from the bottom of the box up
+to 70% of its height with 2 pt margins and leading equal to the font size;
+lines that do not fit are dropped, exactly as OpenPDF does. jpdfsigner
+hard-codes the style (9 pt Helvetica, rgb(16,181,60)); flashsign uses the same
+values as defaults but lets you change them:
+
+| config.ini | CLI flag | Library | Default |
+|---|---|---|---|
+| `font_size` | `-font-size` | `Config.Appearance.FontSize` | `9` |
+| `font_bold` | `-font-bold` | `Config.Appearance.FontBold` | `false` (Helvetica) |
+| `font_color` | `-font-color` | `Config.Appearance.FontColor` | `#10B53C` (rgb 16,181,60) |
+
+Fonts are the standard-14 Helvetica family (not embedded); jpdfsigner embeds a
+metric-compatible Liberation Sans subset for the same text.
+
 ## config.ini reference
 
 | Key | Description |
@@ -174,9 +194,13 @@ key=key.pem
 | `y1` | Signature box bottom Y coordinate |
 | `x2` | Signature box right X coordinate |
 | `y2` | Signature box top Y coordinate |
+| `font_size` | Visible signature text size in points (default: `9`) |
+| `font_bold` | `true` to use Helvetica-Bold for the signature text (default: `false`) |
+| `font_color` | Signature text colour, `#RRGGBB` or `r,g,b` (default: `#10B53C`, i.e. rgb(16,181,60)) |
 | `server` | If `true`, running `flashsign` with no args starts HTTP server from `config.ini` |
 | `server_host` | HTTP server host (default: `localhost`) |
 | `server_port` | HTTP server port (default: `8090`) |
+| `max_concurrent` | Maximum signing operations in flight at once; further requests wait (default: `NumCPU*2`) |
 
 Setting any coordinate (`x1`/`x2`) automatically enables visible signature.
 
@@ -265,7 +289,7 @@ if err != nil {
 os.WriteFile("output.pdf", signed, 0644)
 ```
 
-### Sign streaming (constant memory)
+### Sign with streaming I/O
 
 ```go
 src, _ := os.Open("input.pdf")
@@ -325,9 +349,9 @@ Signing must not degrade an accessible document. When the source PDF is tagged
   that must change.
 - **Adds** `/ViewerPreferences << /DisplayDocTitle true >>` so assistive technology
   announces the document title instead of the file name (PDF/UA-1 7.1). Existing
-  viewer preferences are merged; an explicit `/DisplayDocTitle false` is corrected
-  to `true`. When `/ViewerPreferences` is an indirect reference, that object is
-  updated in the increment instead of the catalog.
+  viewer preferences are merged. Matching the Java signer, an existing explicit
+  `/DisplayDocTitle` value is preserved. When `/ViewerPreferences` is an indirect
+  reference, that object is updated in the increment instead of the catalog.
 - **Adds** `/Tabs /S` to the page that receives the signature widget, so annotation
   tab order follows the structure tree (PDF/UA-1 7.18.3). This applies to invisible
   signatures too, since they also add a widget annotation. Pages that already
@@ -384,9 +408,11 @@ Benchmarked on Apple M4 Pro (14 cores), Go 1.25, RSA-2048 key. Median of 5 runs.
 | BuildIncrement | 0.92μs | 0 | 0 |
 | CMS/PKCS7 Signature | 724μs | 3 | 1.9KB |
 
-`SignStream` allocates a constant ~5 allocations regardless of PDF size: the
-source is read once into a pooled buffer and written straight through to the
-destination, so nothing scales with document size.
+After its buffer pool is warm, `SignStream` performs a roughly constant number
+of allocations regardless of PDF size. Its live working memory is not constant:
+the custom parser needs random access, so one source-sized buffer is retained
+while signing (buffers larger than 8 MiB are not returned to the pool). It still
+avoids allocating a second buffer containing the combined source and output.
 
 ## Test and benchmark guide
 

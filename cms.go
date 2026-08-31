@@ -224,7 +224,10 @@ func (s *Signer) buildCMSSignature(contentHash []byte, signingTime time.Time) ([
 	stAttrContentLen := len(derOIDSigningTime) + stSetLen
 	stAttrLen := derTLVLen(stAttrContentLen) // SEQUENCE
 
-	// Attribute set content (sorted by OID: contentType < messageDigest < signingTime)
+	// Attribute set content in DER SET OF order. DER compares each complete
+	// encoded Attribute (including its SEQUENCE length), which puts these fixed
+	// encodings in contentType, signingTime, messageDigest order. Sorting by OID
+	// alone produces a CMS value that strict verifiers reject.
 	attrSetContentLen := len(s.contentTypeAttr) + mdAttrLen + stAttrLen
 
 	// Get scratch buffer from pool.
@@ -236,6 +239,14 @@ func (s *Signer) buildCMSSignature(contentHash []byte, signingTime time.Time) ([
 	// contentType attribute (pre-computed)
 	scratch = append(scratch, s.contentTypeAttr...)
 
+	// signingTime attribute
+	scratch = append(scratch, 0x30) // SEQUENCE
+	scratch = appendDERLength(scratch, stAttrContentLen)
+	scratch = append(scratch, derOIDSigningTime...)
+	scratch = append(scratch, 0x31) // SET
+	scratch = appendDERLength(scratch, utcTimeLen)
+	scratch = appendUTCTime(scratch, signingTime)
+
 	// messageDigest attribute
 	scratch = append(scratch, 0x30) // SEQUENCE
 	scratch = appendDERLength(scratch, mdAttrContentLen)
@@ -245,14 +256,6 @@ func (s *Signer) buildCMSSignature(contentHash []byte, signingTime time.Time) ([
 	scratch = append(scratch, 0x04) // OCTET STRING
 	scratch = appendDERLength(scratch, hashLen)
 	scratch = append(scratch, contentHash...)
-
-	// signingTime attribute
-	scratch = append(scratch, 0x30) // SEQUENCE
-	scratch = appendDERLength(scratch, stAttrContentLen)
-	scratch = append(scratch, derOIDSigningTime...)
-	scratch = append(scratch, 0x31) // SET
-	scratch = appendDERLength(scratch, utcTimeLen)
-	scratch = appendUTCTime(scratch, signingTime)
 
 	// Phase B: Write attrSetDER (SET wrapper + copy) for hashing.
 	attrSetDERStart := len(scratch)

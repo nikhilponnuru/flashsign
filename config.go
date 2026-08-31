@@ -1,7 +1,6 @@
 // Package flashsign provides high-performance PDF digital signing using PKCS#7
-// detached signatures. It is a drop-in replacement for that eliminates
-// the pdfcpu dependency from the hot path, supports ECDSA keys, and uses zero-alloc
-// incremental update building.
+// detached signatures. It keeps heavyweight PDF libraries off the hot path,
+// supports ECDSA keys, and uses zero-alloc incremental update building.
 //
 // Three signing paths are provided:
 //
@@ -38,6 +37,10 @@ type Config struct {
 	Page    int       // 1-indexed page number (default: 1)
 	Rect    Rectangle // Signature box coordinates
 	Visible bool      // Whether to render a visible signature box
+
+	// Text style of the visible signature box. Zero values reproduce the Java
+	// signer's look (9pt Helvetica, rgb(16,181,60)).
+	Appearance Appearance
 }
 
 // SignParams holds per-document signing parameters.
@@ -97,4 +100,7 @@ type Signer struct {
 	// Per-signer reserved hex placeholder for /Contents.
 	contentsPlaceholderLen int
 	contentsZeros          []byte
+
+	// Resolved Config.Appearance.
+	appearance appearanceStyle
 }

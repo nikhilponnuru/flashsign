@@ -36,6 +36,11 @@ buffer and writes it straight through, so `SignStream` costs a flat ~2KB and 5
 allocations whether the PDF is 10KB or 5MB, while gopdfsigner scales with
 document size.
 
+`B/op` is amortized allocation traffic, not peak live memory. `SignStream` still
+holds one source-sized buffer while parsing and signing; the flat benchmark
+numbers come from reusing that buffer between iterations. Buffers above 8 MiB
+are deliberately not retained by the pool.
+
 > **Reading the latency column:** the gopdfsigner numbers come from an earlier
 > measurement session, so latency ratios within a few percent of 1.00x are run
 > drift rather than signal. The memory and allocation ratios are structural and
@@ -173,7 +178,10 @@ At 4 cores, ECDSA achieves **~10 GB/s** throughput on 5MB PDFs — nearly 10x th
 
 2. **Memory is the differentiator** — the in-memory API allocates 2–6x fewer bytes and 58–98x fewer heap objects per signing operation. Under sustained load (thousands of signs/sec), this translates to significantly lower GC pause times and memory pressure.
 
-3. **The stream API does not scale with document size** — `SignStream` holds a flat ~2KB and 5 allocations from 10KB to 5MB, because the source is read once into a pooled buffer and written straight through. gopdfsigner's equivalent grows to 5.3MB/op on a 5MB PDF, a 2600x gap.
+3. **The stream API minimizes allocation traffic** — `SignStream` reports a
+   flat ~2KB and 5 allocations from 10KB to 5MB after pool warm-up. It still
+   needs one source-sized live buffer for random-access parsing; gopdfsigner's
+   measured allocation traffic grows to 5.3MB/op on a 5MB PDF.
 
 4. **Allocation-free internals** — flashsign's PDF parser and increment builder are fully zero-alloc, using direct byte-offset scanning and pooled buffers. gopdfsigner does not expose these as separate benchmarks.
 

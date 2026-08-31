@@ -11,19 +11,26 @@ import (
 
 // pdfInfo holds the minimal PDF metadata needed for signing.
 type pdfInfo struct {
-	nextObjNr      int
-	prevXrefOffset int64
-	catalogObjNr   int
-	catalogGen     int // generation of the catalog object, echoed by the rewrite
-	pageObjNr      int
-	pageGen        int    // generation of the signature page object
-	catalogRaw     []byte // raw catalog dict content (between << and >>)
-	pageRaw        []byte // raw page dict content
-	existingFields []byte // raw /Fields array content, or nil
-	existingAnnots []byte // raw /Annots array content, or nil
-	infoObjNr      int    // /Info object number, or 0
-	infoGen        int    // /Info generation
-	idArray        []byte // raw /ID array bytes including [ ], or nil
+	nextObjNr        int
+	prevXrefOffset   int64
+	catalogObjNr     int
+	catalogGen       int // generation of the catalog object, echoed by the rewrite
+	pageObjNr        int
+	pageGen          int    // generation of the signature page object
+	catalogRaw       []byte // raw catalog dict content (between << and >>)
+	pageRaw          []byte // raw page dict content
+	acroFormRaw      []byte // raw /AcroForm dict content, or nil when absent
+	existingFields   []byte // raw /Fields array content, or nil
+	existingAnnots   []byte // raw /Annots array content, or nil
+	signatureFieldNr int    // first unused SignatureN field name
+	infoObjNr        int    // /Info object number, or 0
+	infoGen          int    // /Info generation
+	idArray          []byte // raw /ID array bytes including [ ], or nil
+
+	// Encryption state, set only for encrypted documents (see parsePDFAny).
+	encryptRaw     []byte // raw trailer /Encrypt value, echoed into the increment's trailer
+	encryptDictRaw []byte // raw /Encrypt dict content
+	idFirst        []byte // decoded first /ID element, input to key derivation
 
 	// Accessibility (tagged PDF) related state.
 	tagged           bool   // /StructTreeRoot present or /MarkInfo << /Marked true >>
@@ -36,6 +43,7 @@ type pdfInfo struct {
 type xrefEntry struct {
 	offset      int64
 	gen         int
+	free        bool
 	compressed  bool
 	objStreamNr int
 	index       int
@@ -57,9 +65,22 @@ var xrefMapPool = sync.Pool{
 	New: func() any { return make(map[int]xrefEntry, 64) },
 }
 
-// parsePDF parses a PDF byte slice and extracts the minimal info needed for signing.
-// Returns pdfInfo by value (zero allocation for the struct).
+// parsePDF parses a PDF byte slice and extracts the minimal info needed for
+// signing. Encrypted documents are rejected: appending an increment to one
+// requires encrypting the new strings with the file key, which only the
+// password-aware SignAndEncrypt path (via parsePDFAny) can do.
 func parsePDF(data []byte, targetPage int) (pdfInfo, error) {
+	pi, err := parsePDFAny(data, targetPage)
+	if err == nil && pi.encryptRaw != nil {
+		return pdfInfo{}, fmt.Errorf("PDF is encrypted; decrypt it before signing")
+	}
+	return pi, err
+}
+
+// parsePDFAny is parsePDF without the encryption gate; for an encrypted
+// document it also resolves the /Encrypt dict and the first /ID element.
+// Returns pdfInfo by value (zero allocation for the struct).
+func parsePDFAny(data []byte, targetPage int) (pdfInfo, error) {
 	if targetPage < 1 {
 		targetPage = 1
 	}
@@ -79,6 +100,21 @@ func parsePDF(data []byte, targetPage int) (pdfInfo, error) {
 		clear(xref)
 		xrefMapPool.Put(xref)
 	}()
+
+	var encryptDictRaw, idFirst []byte
+	if trailer.encryptRaw != nil {
+		encryptDictRaw = resolveDictOrRef(data, xref, trailer.encryptRaw)
+		if encryptDictRaw == nil {
+			return pdfInfo{}, fmt.Errorf("cannot resolve /Encrypt dictionary")
+		}
+		if ids := extractArrayContent(trailer.idArray); ids != nil {
+			first := skipWhitespaceInSlice(ids, 0)
+			idFirst = decodePDFString(ids[first:findValueEnd(ids, first)])
+		}
+		if len(idFirst) == 0 {
+			return pdfInfo{}, fmt.Errorf("encrypted PDF has no usable /ID")
+		}
+	}
 
 	// Read catalog object.
 	catalogRaw, err := resolveObjectDict(data, xref, trailer.rootObjNr)
@@ -103,32 +139,46 @@ func parsePDF(data []byte, targetPage int) (pdfInfo, error) {
 	}
 
 	// Extract existing /AcroForm /Fields if present.
-	var existingFields []byte
+	var acroFormRaw, existingFields []byte
 	acroFormVal := extractDictValue(catalogRaw, "AcroForm")
-	if acroFormVal != nil {
+	if acroFormVal != nil && !isPDFNull(acroFormVal) {
 		// /AcroForm can be a direct dict or indirect ref.
-		var acroDict []byte
 		if isIndirectRef(acroFormVal) {
 			objNr, _, err := extractIndirectRef(acroFormVal)
-			if err == nil {
-				acroDict, _ = resolveObjectDict(data, xref, objNr)
+			if err != nil {
+				return pdfInfo{}, fmt.Errorf("parse /AcroForm ref: %w", err)
+			}
+			acroFormRaw, err = resolveOptionalDict(data, xref, objNr)
+			if err != nil {
+				return pdfInfo{}, fmt.Errorf("resolve /AcroForm object %d: %w", objNr, err)
 			}
 		} else if bytes.HasPrefix(bytes.TrimSpace(acroFormVal), []byte("<<")) {
-			acroDict = extractDictContent(acroFormVal)
+			acroFormRaw = extractDictContent(acroFormVal)
+		} else {
+			return pdfInfo{}, fmt.Errorf("invalid /AcroForm value")
 		}
-		if acroDict != nil {
-			fieldsVal := extractDictValue(acroDict, "Fields")
-			if fieldsVal != nil {
-				existingFields = resolveArrayContent(data, xref, fieldsVal)
+		if acroFormRaw != nil {
+			// A null /Fields equals an absent one (PDF 32000-1 7.3.7).
+			fieldsVal := extractDictValue(acroFormRaw, "Fields")
+			if fieldsVal != nil && !isPDFNull(fieldsVal) {
+				existingFields, err = resolveArrayContent(data, xref, fieldsVal)
+				if err != nil {
+					return pdfInfo{}, fmt.Errorf("resolve /AcroForm /Fields: %w", err)
+				}
 			}
 		}
 	}
 
+	signatureFieldNr := nextSignatureFieldNumber(data, xref, existingFields)
+
 	// Extract existing /Annots if present.
 	var existingAnnots []byte
 	annotsVal := extractDictValue(pageRaw, "Annots")
-	if annotsVal != nil {
-		existingAnnots = resolveArrayContent(data, xref, annotsVal)
+	if annotsVal != nil && !isPDFNull(annotsVal) {
+		existingAnnots, err = resolveArrayContent(data, xref, annotsVal)
+		if err != nil {
+			return pdfInfo{}, fmt.Errorf("resolve page /Annots: %w", err)
+		}
 	}
 
 	// Accessibility state: tagged documents need /DisplayDocTitle and /Tabs /S.
@@ -151,20 +201,35 @@ func parsePDF(data []byte, targetPage int) (pdfInfo, error) {
 		pageHasTabs = findTopLevelKey(pageRaw, "Tabs") >= 0
 	}
 
+	// Sloppy producers understate the trailer /Size; allocating new object
+	// numbers from it would then collide with existing objects. Trust whichever
+	// is larger: /Size or the highest object number actually cross-referenced.
+	nextObjNr := trailer.size
+	for objNr := range xref {
+		if objNr >= nextObjNr {
+			nextObjNr = objNr + 1
+		}
+	}
+
 	return pdfInfo{
-		nextObjNr:      trailer.size,
-		prevXrefOffset: prevXrefOffset,
-		catalogObjNr:   trailer.rootObjNr,
-		catalogGen:     xref[trailer.rootObjNr].gen,
-		pageObjNr:      pageObjNr,
-		pageGen:        xref[pageObjNr].gen,
-		catalogRaw:     catalogRaw,
-		pageRaw:        pageRaw,
-		existingFields: existingFields,
-		existingAnnots: existingAnnots,
-		infoObjNr:      trailer.infoObjNr,
-		infoGen:        trailer.infoGen,
-		idArray:        trailer.idArray,
+		nextObjNr:        nextObjNr,
+		prevXrefOffset:   prevXrefOffset,
+		catalogObjNr:     trailer.rootObjNr,
+		catalogGen:       xref[trailer.rootObjNr].gen,
+		pageObjNr:        pageObjNr,
+		pageGen:          xref[pageObjNr].gen,
+		catalogRaw:       catalogRaw,
+		pageRaw:          pageRaw,
+		acroFormRaw:      acroFormRaw,
+		existingFields:   existingFields,
+		existingAnnots:   existingAnnots,
+		signatureFieldNr: signatureFieldNr,
+		infoObjNr:        trailer.infoObjNr,
+		infoGen:          trailer.infoGen,
+		idArray:          trailer.idArray,
+		encryptRaw:       trailer.encryptRaw,
+		encryptDictRaw:   encryptDictRaw,
+		idFirst:          idFirst,
 
 		tagged:           tagged,
 		viewerPrefsObjNr: vpObjNr,
@@ -212,13 +277,15 @@ func findStartxref(data []byte) (int64, error) {
 
 // trailerInfo holds fields extracted from a PDF trailer.
 type trailerInfo struct {
-	size      int
-	rootObjNr int
-	rootGen   int
-	infoObjNr int
-	infoGen   int
-	idArray   []byte
-	prevXref  int64
+	size       int
+	rootObjNr  int
+	rootGen    int
+	infoObjNr  int
+	infoGen    int
+	idArray    []byte
+	prevXref   int64
+	xrefStm    int64  // hybrid-reference file: offset of the companion xref stream, or 0
+	encryptRaw []byte // raw /Encrypt value, or nil when unencrypted
 }
 
 // parseXrefChain follows the /Prev chain to build a complete xref table.
@@ -257,11 +324,27 @@ func parseXrefChain(data []byte, startOffset int64) (map[int]xrefEntry, trailerI
 		var trailer trailerInfo
 		var err error
 
+		if offset >= int64(len(data)) {
+			clear(xref)
+			xrefMapPool.Put(xref)
+			return nil, trailerInfo{}, fmt.Errorf("xref offset %d beyond end of file (%d bytes)", offset, len(data))
+		}
+
 		// Determine if this is a traditional xref table or xref stream.
-		if offset < int64(len(data)) && bytes.HasPrefix(data[offset:], kwXref) {
+		if bytes.HasPrefix(data[offset:], kwXref) {
 			trailer, err = parseTraditionalXref(data, offset, xref)
+			if err == nil && trailer.xrefStm > 0 {
+				// Hybrid-reference file (PDF 32000-1 7.5.8.4): objects held in
+				// object streams are listed only in this companion xref stream,
+				// which readers consult after the table and before /Prev.
+				if trailer.xrefStm >= int64(len(data)) {
+					err = fmt.Errorf("/XRefStm offset %d beyond end of file", trailer.xrefStm)
+				} else {
+					_, err = parseXrefStream(data, trailer.xrefStm, xref, true)
+				}
+			}
 		} else {
-			trailer, err = parseXrefStream(data, offset, xref)
+			trailer, err = parseXrefStream(data, offset, xref, false)
 		}
 		if err != nil {
 			// Return map to pool on error.
@@ -357,9 +440,9 @@ func parseTraditionalXref(data []byte, offset int64, xref map[int]xrefEntry) (tr
 			}
 
 			objNr := startObjNr + i
-			if inUse && objNr > 0 {
+			if objNr > 0 {
 				if _, exists := xref[objNr]; !exists {
-					xref[objNr] = xrefEntry{offset: entryOffset, gen: gen}
+					xref[objNr] = xrefEntry{offset: entryOffset, gen: gen, free: !inUse}
 				}
 			}
 		}
@@ -384,7 +467,12 @@ func parseTraditionalXref(data []byte, offset int64, xref map[int]xrefEntry) (tr
 
 // parseXrefStream parses a cross-reference stream object (PDF 1.5+).
 // Writes entries directly into xref with "first write wins" semantics.
-func parseXrefStream(data []byte, offset int64, xref map[int]xrefEntry) (trailerInfo, error) {
+//
+// hybrid is set when the stream is a classic table's /XRefStm companion. Such a
+// table lists the objects that live in object streams as free (so readers
+// without object-stream support ignore them), and the stream's entries take
+// precedence over those free entries.
+func parseXrefStream(data []byte, offset int64, xref map[int]xrefEntry, hybrid bool) (trailerInfo, error) {
 	pos := int(offset)
 
 	// Skip object header: "N G obj"
@@ -460,18 +548,23 @@ func parseXrefStream(data []byte, offset int64, xref map[int]xrefEntry) (trailer
 			switch {
 			case w[0] == 0 || entryType == 1: // type 1: regular object
 				if objNr > 0 {
-					if _, exists := xref[objNr]; !exists {
+					if existing, exists := xref[objNr]; !exists || (hybrid && existing.free) {
 						xref[objNr] = xrefEntry{offset: int64(field2), gen: int(field3)}
 					}
 				}
 			case entryType == 2: // type 2: compressed object
 				if objNr > 0 {
-					if _, exists := xref[objNr]; !exists {
+					if existing, exists := xref[objNr]; !exists || (hybrid && existing.free) {
 						xref[objNr] = xrefEntry{compressed: true, objStreamNr: int(field2), index: int(field3)}
 					}
 				}
+			case entryType == 0: // free; do not resurrect an older /Prev entry
+				if objNr > 0 {
+					if _, exists := xref[objNr]; !exists {
+						xref[objNr] = xrefEntry{free: true, gen: int(field3)}
+					}
+				}
 			}
-			// type 0: free entry, skip
 		}
 	}
 
@@ -518,9 +611,139 @@ func readStreamData(data []byte, dictContent []byte, dictEnd int) ([]byte, error
 	// Check /Filter.
 	filterVal := extractDictValue(dictContent, "Filter")
 	if filterVal != nil && bytes.Contains(filterVal, []byte("FlateDecode")) {
-		return inflateBytes(streamBytes)
+		inflated, err := inflateBytes(streamBytes)
+		if err != nil {
+			return nil, err
+		}
+		return applyDecodeParms(dictContent, inflated)
 	}
 	return streamBytes, nil
+}
+
+// applyDecodeParms undoes the /DecodeParms predictor applied before Flate
+// compression. Xref and object streams from mainstream producers (Acrobat,
+// Chrome, Ghostscript) near-universally use a PNG predictor.
+func applyDecodeParms(dictContent, data []byte) ([]byte, error) {
+	parms := extractDictValue(dictContent, "DecodeParms")
+	if parms == nil {
+		return data, nil
+	}
+	// A single-filter pipeline may still wrap its parms in a one-element array.
+	if arr := extractArrayContent(parms); arr != nil {
+		parms = arr
+	}
+	parmsDict := extractDictContent(parms)
+	if parmsDict == nil {
+		// null, or a form this parser cannot use: nothing to undo.
+		return data, nil
+	}
+
+	predictor := extractDictInt(parmsDict, "Predictor", 1)
+	if predictor <= 1 {
+		return data, nil
+	}
+	if predictor < 10 {
+		return nil, fmt.Errorf("unsupported /Predictor %d (only PNG predictors are supported)", predictor)
+	}
+	columns := extractDictInt(parmsDict, "Columns", 1)
+	colors := extractDictInt(parmsDict, "Colors", 1)
+	bpc := extractDictInt(parmsDict, "BitsPerComponent", 8)
+	bytesPerPixel := (colors*bpc + 7) / 8
+	rowLen := (columns*colors*bpc + 7) / 8
+	return unpredictPNG(data, rowLen, bytesPerPixel)
+}
+
+// unpredictPNG reverses PNG row filtering (RFC 2083): each row is one filter
+// tag byte followed by rowLen filtered bytes.
+func unpredictPNG(data []byte, rowLen, bytesPerPixel int) ([]byte, error) {
+	if rowLen <= 0 {
+		return nil, fmt.Errorf("invalid predictor row length %d", rowLen)
+	}
+	if bytesPerPixel <= 0 {
+		bytesPerPixel = 1
+	}
+	stride := rowLen + 1
+	if len(data)%stride != 0 {
+		return nil, fmt.Errorf("predictor data length %d is not a multiple of row size %d", len(data), stride)
+	}
+
+	rows := len(data) / stride
+	out := make([]byte, 0, rows*rowLen)
+	prev := make([]byte, rowLen)
+	cur := make([]byte, rowLen)
+
+	for r := 0; r < rows; r++ {
+		filterType := data[r*stride]
+		copy(cur, data[r*stride+1:(r+1)*stride])
+
+		switch filterType {
+		case 0: // None
+		case 1: // Sub
+			for i := bytesPerPixel; i < rowLen; i++ {
+				cur[i] += cur[i-bytesPerPixel]
+			}
+		case 2: // Up
+			for i := 0; i < rowLen; i++ {
+				cur[i] += prev[i]
+			}
+		case 3: // Average
+			for i := 0; i < rowLen; i++ {
+				left := 0
+				if i >= bytesPerPixel {
+					left = int(cur[i-bytesPerPixel])
+				}
+				cur[i] += byte((left + int(prev[i])) / 2)
+			}
+		case 4: // Paeth
+			for i := 0; i < rowLen; i++ {
+				var left, upLeft byte
+				if i >= bytesPerPixel {
+					left = cur[i-bytesPerPixel]
+					upLeft = prev[i-bytesPerPixel]
+				}
+				cur[i] += paethPredictor(left, prev[i], upLeft)
+			}
+		default:
+			return nil, fmt.Errorf("invalid PNG filter type %d", filterType)
+		}
+
+		out = append(out, cur...)
+		prev, cur = cur, prev
+	}
+	return out, nil
+}
+
+func paethPredictor(a, b, c byte) byte {
+	p := int(a) + int(b) - int(c)
+	pa, pb, pc := absInt(p-int(a)), absInt(p-int(b)), absInt(p-int(c))
+	if pa <= pb && pa <= pc {
+		return a
+	}
+	if pb <= pc {
+		return b
+	}
+	return c
+}
+
+func absInt(v int) int {
+	if v < 0 {
+		return -v
+	}
+	return v
+}
+
+// extractDictInt reads an integer dict entry, returning def when absent or
+// unparsable.
+func extractDictInt(dict []byte, key string, def int) int {
+	v := extractDictValue(dict, key)
+	if v == nil {
+		return def
+	}
+	n, w := parseInt(v, skipWhitespaceInSlice(v, 0))
+	if w == 0 {
+		return def
+	}
+	return n
 }
 
 // streamBytesByLength delimits the stream body using the dict's /Length, which
@@ -543,19 +766,32 @@ func streamBytesByLength(data []byte, dictContent []byte, pos int) ([]byte, bool
 	return data[pos : pos+n], true
 }
 
+// maxInflatedStream caps how far a FlateDecode stream may expand, so a
+// crafted deflate bomb in an xref or object stream cannot exhaust memory.
+// Real xref/object streams sit orders of magnitude below this.
+const maxInflatedStream = 256 << 20
+
 // inflateBytes decompresses FlateDecode data.
 // PDF FlateDecode uses zlib (RFC 1950) wrapping deflate. We try zlib first,
 // falling back to raw deflate for non-standard producers.
 func inflateBytes(compressed []byte) ([]byte, error) {
-	r, err := zlib.NewReader(bytes.NewReader(compressed))
+	var r io.ReadCloser
+	zr, err := zlib.NewReader(bytes.NewReader(compressed))
 	if err != nil {
 		// Fallback to raw deflate for non-standard streams.
-		fr := flate.NewReader(bytes.NewReader(compressed))
-		defer fr.Close()
-		return io.ReadAll(fr)
+		r = flate.NewReader(bytes.NewReader(compressed))
+	} else {
+		r = zr
 	}
 	defer r.Close()
-	return io.ReadAll(r)
+	out, err := io.ReadAll(io.LimitReader(r, maxInflatedStream+1))
+	if err != nil {
+		return nil, err
+	}
+	if len(out) > maxInflatedStream {
+		return nil, fmt.Errorf("decompressed stream exceeds %d bytes", maxInflatedStream)
+	}
+	return out, nil
 }
 
 // parseTrailerDict parses a trailer dictionary at pos.
@@ -589,6 +825,16 @@ func extractTrailerFields(dict []byte) trailerInfo {
 		// Store the raw /ID value including the array brackets.
 		t.idArray = v
 	}
+	if v := extractDictValue(dict, "Encrypt"); v != nil && !isPDFNull(v) {
+		t.encryptRaw = v
+	}
+	if v := extractDictValue(dict, "XRefStm"); v != nil {
+		p := skipWhitespaceInSlice(v, 0)
+		n, w := parseInt(v, p)
+		if w > 0 && n > 0 {
+			t.xrefStm = int64(n)
+		}
+	}
 
 	return t
 }
@@ -607,6 +853,9 @@ func readDictAt(data []byte, pos int) ([]byte, int, error) {
 	for pos < len(data) && depth > 0 {
 		b := data[pos]
 		switch {
+		case b == '%':
+			pos = skipPDFComment(data, pos)
+			continue
 		case b == '(':
 			pos = skipPDFStringLiteral(data, pos)
 			continue
@@ -636,12 +885,45 @@ func resolveObjectDict(data []byte, xref map[int]xrefEntry, objNr int) ([]byte, 
 	if !ok {
 		return nil, fmt.Errorf("object %d not in xref", objNr)
 	}
+	if entry.free {
+		return nil, fmt.Errorf("object %d is free", objNr)
+	}
 
 	if entry.compressed {
 		return readCompressedObject(data, xref, entry.objStreamNr, entry.index, objNr)
 	}
 
 	return readObjectDictAt(data, entry.offset)
+}
+
+// resolveOptionalDict resolves an indirect reference whose target may
+// legitimately be absent: an undefined or freed object is the null object
+// (PDF 32000-1 7.3.10) and a null dict entry equals an omitted one (7.3.7), so
+// both report (nil, nil) rather than an error.
+func resolveOptionalDict(data []byte, xref map[int]xrefEntry, objNr int) ([]byte, error) {
+	entry, ok := xref[objNr]
+	if !ok || entry.free {
+		return nil, nil
+	}
+	if entry.compressed {
+		obj, err := readCompressedObject(data, xref, entry.objStreamNr, entry.index, objNr)
+		if err != nil {
+			return nil, err
+		}
+		if isPDFNull(obj) {
+			return nil, nil
+		}
+		return obj, nil
+	}
+	pos := skipPastKeyword(data, int(entry.offset), kwObj)
+	if pos < 0 {
+		return nil, fmt.Errorf("obj keyword not found at offset %d", entry.offset)
+	}
+	if bytes.HasPrefix(data[pos:], []byte("null")) {
+		return nil, nil
+	}
+	content, _, err := readDictAt(data, pos)
+	return content, err
 }
 
 // readObjectDictAt reads the dict content of a regular object at the given offset.
@@ -661,6 +943,10 @@ func readCompressedObject(data []byte, xref map[int]xrefEntry, objStreamNr int, 
 	streamEntry, ok := xref[objStreamNr]
 	if !ok {
 		return nil, fmt.Errorf("object stream %d not in xref", objStreamNr)
+	}
+	if streamEntry.free {
+		// A free entry's offset field is a free-list link, not a file position.
+		return nil, fmt.Errorf("object stream %d is free", objStreamNr)
 	}
 	if streamEntry.compressed {
 		return nil, fmt.Errorf("nested compressed object streams not supported")
@@ -758,6 +1044,9 @@ func findTopLevelKey(dict []byte, key string) int {
 
 	for i := 0; i < len(dict); {
 		switch dict[i] {
+		case '%':
+			i = skipPDFComment(dict, i)
+			continue
 		case '(':
 			i = skipPDFStringLiteral(dict, i)
 			continue
@@ -815,12 +1104,28 @@ func extractDictValue(dict []byte, key string) []byte {
 // string literal starting at data[pos] == '(', or len(data) if it is
 // unterminated.
 func skipPDFStringLiteral(data []byte, pos int) int {
+	depth := 1
 	for i := pos + 1; i < len(data); {
 		switch data[i] {
 		case '\\':
-			i += 2
+			i++
+			if i < len(data) && data[i] == '\r' {
+				i++
+				if i < len(data) && data[i] == '\n' {
+					i++
+				}
+			} else if i < len(data) {
+				i++
+			}
+		case '(':
+			depth++
+			i++
 		case ')':
-			return i + 1
+			depth--
+			i++
+			if depth == 0 {
+				return i
+			}
 		default:
 			i++
 		}
@@ -841,6 +1146,10 @@ func findValueEnd(dict []byte, pos int) int {
 		depth := 1
 		i := pos + 2
 		for i < len(dict) && depth > 0 {
+			if dict[i] == '%' {
+				i = skipPDFComment(dict, i)
+				continue
+			}
 			if dict[i] == '(' {
 				i = skipPDFStringLiteral(dict, i)
 				continue
@@ -863,6 +1172,10 @@ func findValueEnd(dict []byte, pos int) int {
 		depth := 1
 		i := pos + 1
 		for i < len(dict) && depth > 0 {
+			if dict[i] == '%' {
+				i = skipPDFComment(dict, i)
+				continue
+			}
 			if dict[i] == '(' {
 				i = skipPDFStringLiteral(dict, i)
 				continue
@@ -1010,36 +1323,57 @@ func extractDictContent(val []byte) []byte {
 }
 
 // resolveArrayContent resolves an array value which may be direct or indirect.
-// Returns the content inside [ ] (without brackets).
-func resolveArrayContent(data []byte, xref map[int]xrefEntry, val []byte) []byte {
+// It returns the content inside [ ] (without brackets). Existing fields and
+// annotations must never be silently dropped, so malformed or unresolvable
+// values are reported to the caller.
+func resolveArrayContent(data []byte, xref map[int]xrefEntry, val []byte) ([]byte, error) {
 	val = bytes.TrimSpace(val)
 	if len(val) > 0 && val[0] == '[' {
-		return extractArrayContent(val)
+		if len(val) < 2 || val[len(val)-1] != ']' {
+			return nil, fmt.Errorf("malformed direct array near %q", safeSlice(val, 0, 80))
+		}
+		return bytes.TrimSpace(val[1 : len(val)-1]), nil
 	}
-	// Might be an indirect ref to an array object.
-	if isIndirectRef(val) {
-		objNr, _, err := extractIndirectRef(val)
+	if !isIndirectRef(val) {
+		return nil, fmt.Errorf("expected an array or indirect reference, got %q", val)
+	}
+
+	objNr, _, err := extractIndirectRef(val)
+	if err != nil {
+		return nil, err
+	}
+	entry, ok := xref[objNr]
+	if !ok {
+		return nil, fmt.Errorf("array object %d not in xref", objNr)
+	}
+	if entry.free {
+		// A free entry's offset field is a free-list link, not a file position.
+		return nil, fmt.Errorf("array object %d is free", objNr)
+	}
+
+	var objData []byte
+	if entry.compressed {
+		objData, err = readCompressedObject(data, xref, entry.objStreamNr, entry.index, objNr)
 		if err != nil {
-			return nil
+			return nil, fmt.Errorf("read compressed array object %d: %w", objNr, err)
 		}
-		entry, ok := xref[objNr]
-		if !ok || entry.compressed {
-			return nil
-		}
-		pos := int(entry.offset)
-		pos = skipPastKeyword(data, pos, kwObj)
+	} else {
+		pos := skipPastKeyword(data, int(entry.offset), kwObj)
 		if pos < 0 {
-			return nil
+			return nil, fmt.Errorf("obj keyword not found for array object %d", objNr)
 		}
-		pos = skipWhitespace(data, pos)
-		if pos < len(data) && data[pos] == '[' {
-			end := findMatchingBracket(data, pos)
-			if end > pos {
-				return bytes.TrimSpace(data[pos+1 : end])
-			}
-		}
+		objData = data[skipWhitespace(data, pos):]
 	}
-	return nil
+
+	objData = bytes.TrimSpace(objData)
+	if len(objData) == 0 || objData[0] != '[' {
+		return nil, fmt.Errorf("object %d is not an array", objNr)
+	}
+	end := findMatchingBracket(objData, 0)
+	if end < 0 {
+		return nil, fmt.Errorf("array object %d is unterminated", objNr)
+	}
+	return bytes.TrimSpace(objData[1:end]), nil
 }
 
 // resolvePageFromTree walks the page tree to find the target page.
@@ -1163,14 +1497,177 @@ func parseIndirectRefs(content []byte, refs []int) []int {
 	return refs
 }
 
+// nextSignatureFieldNumber mirrors OpenPDF's automatic SignatureN naming and
+// avoids duplicate field names when a document is signed more than once.
+func nextSignatureFieldNumber(data []byte, xref map[int]xrefEntry, fields []byte) int {
+	if len(fields) == 0 {
+		return 1
+	}
+
+	used := make(map[int]struct{})
+	seen := make(map[int]struct{})
+	var visit func([]byte, int)
+	visit = func(content []byte, depth int) {
+		if depth > 50 {
+			return
+		}
+		var refBuf [16]int
+		for _, objNr := range parseIndirectRefs(content, refBuf[:0]) {
+			if _, ok := seen[objNr]; ok {
+				continue
+			}
+			seen[objNr] = struct{}{}
+
+			dict, err := resolveObjectDict(data, xref, objNr)
+			if err != nil {
+				continue
+			}
+			if name := decodePDFString(extractDictValue(dict, "T")); bytes.HasPrefix(name, []byte("Signature")) {
+				nr, n := parseInt(name, len("Signature"))
+				if n > 0 && len("Signature")+n == len(name) && nr > 0 {
+					used[nr] = struct{}{}
+				}
+			}
+			if kids := extractDictValue(dict, "Kids"); kids != nil {
+				kidsContent, err := resolveArrayContent(data, xref, kids)
+				if err == nil {
+					visit(kidsContent, depth+1)
+				}
+			}
+		}
+	}
+	visit(fields, 0)
+
+	for nr := 1; ; nr++ {
+		if _, exists := used[nr]; !exists {
+			return nr
+		}
+	}
+}
+
+// decodePDFString decodes a PDF string object into raw bytes, accepting both
+// literal '(...)' and hex '<...>' forms, and converting Latin-only UTF-16BE
+// content, so a field name is recognised regardless of how its producer
+// encoded it.
+func decodePDFString(val []byte) []byte {
+	val = bytes.TrimSpace(val)
+	var out []byte
+	if len(val) >= 2 && val[0] == '<' && val[len(val)-1] == '>' {
+		out = decodeHexString(val[1 : len(val)-1])
+	} else {
+		out = extractLiteralString(val)
+	}
+	return stripUTF16BE(out)
+}
+
+// decodeHexString decodes the content of a PDF hex string (between < and >).
+// An odd final digit implies a trailing 0 (PDF 32000-1 7.3.4.3).
+func decodeHexString(h []byte) []byte {
+	out := make([]byte, 0, len(h)/2)
+	var hi byte
+	hasHi := false
+	for _, c := range h {
+		var v byte
+		switch {
+		case c >= '0' && c <= '9':
+			v = c - '0'
+		case c >= 'a' && c <= 'f':
+			v = c - 'a' + 10
+		case c >= 'A' && c <= 'F':
+			v = c - 'A' + 10
+		default:
+			if isSpace(c) {
+				continue
+			}
+			return nil
+		}
+		if !hasHi {
+			hi, hasHi = v, true
+		} else {
+			out = append(out, hi<<4|v)
+			hasHi = false
+		}
+	}
+	if hasHi {
+		out = append(out, hi<<4)
+	}
+	return out
+}
+
+// stripUTF16BE converts a UTF-16BE string (BOM FE FF) holding only Latin
+// characters to single bytes; anything else is returned unchanged.
+func stripUTF16BE(s []byte) []byte {
+	if len(s) < 2 || s[0] != 0xFE || s[1] != 0xFF {
+		return s
+	}
+	out := make([]byte, 0, (len(s)-2)/2)
+	for i := 2; i+1 < len(s); i += 2 {
+		if s[i] != 0 {
+			return s
+		}
+		out = append(out, s[i+1])
+	}
+	return out
+}
+
+// extractLiteralString decodes the ASCII subset needed for PDF field names.
+// It handles the escapes allowed in literal strings, including octal escapes.
+func extractLiteralString(val []byte) []byte {
+	val = bytes.TrimSpace(val)
+	if len(val) < 2 || val[0] != '(' || val[len(val)-1] != ')' {
+		return nil
+	}
+	out := make([]byte, 0, len(val)-2)
+	for i := 1; i < len(val)-1; i++ {
+		if val[i] != '\\' {
+			out = append(out, val[i])
+			continue
+		}
+		i++
+		if i >= len(val)-1 {
+			break
+		}
+		switch val[i] {
+		case 'n':
+			out = append(out, '\n')
+		case 'r':
+			out = append(out, '\r')
+		case 't':
+			out = append(out, '\t')
+		case 'b':
+			out = append(out, '\b')
+		case 'f':
+			out = append(out, '\f')
+		case '\n':
+			// A backslash followed by a line ending is a continuation.
+		case '\r':
+			if i+1 < len(val)-1 && val[i+1] == '\n' {
+				i++
+			}
+		default:
+			if val[i] >= '0' && val[i] <= '7' {
+				n := int(val[i] - '0')
+				for count := 1; count < 3 && i+1 < len(val)-1 && val[i+1] >= '0' && val[i+1] <= '7'; count++ {
+					i++
+					n = n*8 + int(val[i]-'0')
+				}
+				out = append(out, byte(n))
+			} else {
+				out = append(out, val[i])
+			}
+		}
+	}
+	return out
+}
+
 // Helper functions.
 
 func isSpace(b byte) bool {
-	return b == ' ' || b == '\n' || b == '\r' || b == '\t'
+	return b == 0 || b == ' ' || b == '\n' || b == '\r' || b == '\t' || b == '\f'
 }
 
 func isPDFDelimiter(b byte) bool {
-	return b == ' ' || b == '\n' || b == '\r' || b == '\t' ||
+	return isSpace(b) ||
 		b == '/' || b == '<' || b == '>' || b == '[' || b == ']' ||
 		b == '(' || b == ')'
 }
@@ -1180,21 +1677,31 @@ func isPDFStructDelimiter(b byte) bool {
 }
 
 func skipWhitespace(data []byte, pos int) int {
-	for pos < len(data) && isSpace(data[pos]) {
-		pos++
-	}
-	// Also skip PDF comments (% to end of line).
-	if pos < len(data) && data[pos] == '%' {
-		for pos < len(data) && data[pos] != '\n' && data[pos] != '\r' {
+	for {
+		for pos < len(data) && isSpace(data[pos]) {
 			pos++
 		}
-		return skipWhitespace(data, pos)
+		if pos >= len(data) || data[pos] != '%' {
+			return pos
+		}
+		pos = skipPDFComment(data, pos)
 	}
-	return pos
 }
 
 func skipWhitespaceInSlice(data []byte, pos int) int {
-	for pos < len(data) && isSpace(data[pos]) {
+	for {
+		for pos < len(data) && isSpace(data[pos]) {
+			pos++
+		}
+		if pos >= len(data) || data[pos] != '%' {
+			return pos
+		}
+		pos = skipPDFComment(data, pos)
+	}
+}
+
+func skipPDFComment(data []byte, pos int) int {
+	for pos < len(data) && data[pos] != '\n' && data[pos] != '\r' {
 		pos++
 	}
 	return pos
@@ -1202,7 +1709,11 @@ func skipWhitespaceInSlice(data []byte, pos int) int {
 
 // skipPastKeyword finds keyword in data starting at pos and returns the position
 // after the keyword plus any trailing whitespace. Uses []byte keyword to avoid allocation.
+// Reports -1 for an out-of-range pos, which callers get from untrusted xref offsets.
 func skipPastKeyword(data []byte, pos int, keyword []byte) int {
+	if pos < 0 || pos > len(data) {
+		return -1
+	}
 	idx := bytes.Index(data[pos:], keyword)
 	if idx == -1 {
 		return -1
@@ -1262,6 +1773,10 @@ func findMatchingBracket(data []byte, pos int) int {
 	depth := 1
 	i := pos + 1
 	for i < len(data) && depth > 0 {
+		if data[i] == '%' {
+			i = skipPDFComment(data, i)
+			continue
+		}
 		if data[i] == '(' {
 			i = skipPDFStringLiteral(data, i)
 			continue

@@ -51,6 +51,9 @@ Sign flags:
   -page int          Page for visible signature (default: 1)
   -visible           Render a visible signature box
   -x1, -y1, -x2, -y2 float  Signature box coordinates
+  -font-size float   Signature text size in points (default: 9; config key: font_size)
+  -font-bold         Use Helvetica-Bold (default: false; config key: font_bold)
+  -font-color string Signature text colour, #RRGGBB or r,g,b (default: #10B53C; config key: font_color)
 
 Encrypt flags:
   -password string   Encryption password (required for encrypt)
@@ -59,7 +62,7 @@ Encrypt flags:
 Serve flags:
   -host string       Listen host (default: localhost; config key: server_host)
   -port int          Listen port (default: 8090; config key: server_port)
-  -max-concurrent int  Max concurrent sign operations (default: NumCPU*2)
+  -max-concurrent int  Max concurrent sign operations (default: NumCPU*2; config key: max_concurrent)
 `
 
 type requestCoordinates struct {
@@ -141,6 +144,9 @@ func main() {
 	y2 := fs.Float64("y2", 0, "Signature box Y2")
 
 	password := fs.String("password", "", "Encryption password")
+	fontSize := fs.Float64("font-size", 0, "Signature text size in points")
+	fontBold := fs.Bool("font-bold", false, "Use Helvetica-Bold for the signature text")
+	fontColor := fs.String("font-color", "", "Signature text colour (#RRGGBB or r,g,b)")
 	aes256 := fs.Bool("aes256", false, "Use AES-256 instead of AES-128")
 	host := fs.String("host", "", "Listen host for serve mode")
 	port := fs.Int("port", 0, "Listen port for serve mode")
@@ -210,6 +216,24 @@ func main() {
 				*y2 = v
 			}
 		}
+		if !flagSet["font-size"] && cfg["font_size"] != "" {
+			if v, err := strconv.ParseFloat(cfg["font_size"], 64); err == nil {
+				*fontSize = v
+			}
+		}
+		if !flagSet["font-bold"] && cfg["font_bold"] != "" {
+			if v, err := strconv.ParseBool(cfg["font_bold"]); err == nil {
+				*fontBold = v
+			}
+		}
+		if !flagSet["font-color"] && cfg["font_color"] != "" {
+			*fontColor = cfg["font_color"]
+		}
+		if !flagSet["max-concurrent"] && cfg["max_concurrent"] != "" {
+			if v, err := strconv.Atoi(cfg["max_concurrent"]); err == nil {
+				*maxConcurrent = v
+			}
+		}
 		if !flagSet["host"] && cfg["server_host"] != "" {
 			*host = cfg["server_host"]
 		}
@@ -244,6 +268,9 @@ func main() {
 	signer, err := buildSigner(*pfxPath, *pfxPass, *certPath, *keyPath)
 	if err != nil {
 		fatal("load certificate: %v", err)
+	}
+	if err := signer.SetAppearance(flashsign.Appearance{FontSize: *fontSize, FontBold: *fontBold, FontColor: *fontColor}); err != nil {
+		fatal("%v", err)
 	}
 
 	params := flashsign.SignParams{
@@ -346,24 +373,24 @@ func runServer(addr string, signer *flashsign.Signer, defaults serverDefaults, m
 
 		var req signRequest
 		if err := json.Unmarshal(body, &req); err != nil {
-			send(http.StatusInternalServerError, err.Error())
+			send(http.StatusBadRequest, err.Error())
 			return
 		}
 		if req.InputFile == "" || req.OutputFile == "" {
-			send(http.StatusInternalServerError, "input_file and output_file are required")
+			send(http.StatusBadRequest, "input_file and output_file are required")
 			return
 		}
 
-		reason := strings.TrimSpace(req.Reason)
-		if reason == "" {
+		reason := req.Reason
+		if strings.TrimSpace(reason) == "" {
 			reason = defaults.reason
 		}
-		contact := strings.TrimSpace(req.Contact)
-		if contact == "" {
+		contact := req.Contact
+		if strings.TrimSpace(contact) == "" {
 			contact = defaults.contact
 		}
-		location := strings.TrimSpace(req.Location)
-		if location == "" {
+		location := req.Location
+		if strings.TrimSpace(location) == "" {
 			location = defaults.location
 		}
 
@@ -468,6 +495,9 @@ func maybeRunCompatServerFromDefaultConfig() (bool, error) {
 	if err != nil {
 		return false, err
 	}
+	if err := signer.SetAppearance(appearanceFromConfig(cfg)); err != nil {
+		return false, err
+	}
 
 	page := 1
 	if v, err := strconv.Atoi(cfg["page"]); err == nil && v > 0 {
@@ -511,6 +541,9 @@ func maybeRunCompatServerFromDefaultConfig() (bool, error) {
 	}
 
 	maxConcurrent := runtime.NumCPU() * 2
+	if v, err := strconv.Atoi(cfg["max_concurrent"]); err == nil && v > 0 {
+		maxConcurrent = v
+	}
 
 	defaults := serverDefaults{
 		reason:   cfg["reason"],
@@ -566,6 +599,20 @@ func resolvePathFromConfig(configPath, pathVal, srcPath string) string {
 		return filepath.Join(cfgDir, pathVal)
 	}
 	return pathVal
+}
+
+// appearanceFromConfig reads the optional font_size / font_bold / font_color
+// keys; absent keys keep the Java signer's defaults.
+func appearanceFromConfig(cfg map[string]string) flashsign.Appearance {
+	var a flashsign.Appearance
+	if v, err := strconv.ParseFloat(cfg["font_size"], 64); err == nil {
+		a.FontSize = v
+	}
+	if v, err := strconv.ParseBool(cfg["font_bold"]); err == nil {
+		a.FontBold = v
+	}
+	a.FontColor = cfg["font_color"]
+	return a
 }
 
 // loadConfig reads a simple key=value INI file. Lines starting with # or ;
