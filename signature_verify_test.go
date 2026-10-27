@@ -45,13 +45,15 @@ func verifyPDFSignature(pdf []byte) error {
 	if len(gap) < 2 || gap[0] != '<' || gap[len(gap)-1] != '>' {
 		return fmt.Errorf("ByteRange gap is not a hex string (len %d)", len(gap))
 	}
-	hexSig := bytes.TrimRight(gap[1:len(gap)-1], "0")
-	if len(hexSig)%2 == 1 {
-		hexSig = append(hexSig, '0')
-	}
-	der, err := hex.DecodeString(string(hexSig))
+	// The CMS is zero-padded to the placeholder size. Cut it at the length its
+	// DER header declares: trimming trailing "0"s instead would also eat a
+	// signature that genuinely ends in a zero byte.
+	der, err := hex.DecodeString(string(gap[1 : len(gap)-1]))
 	if err != nil {
 		return fmt.Errorf("decode /Contents hex: %w", err)
+	}
+	if der, err = trimDERPadding(der); err != nil {
+		return err
 	}
 
 	signed := make([]byte, 0, r[1]+r[3])
@@ -194,4 +196,28 @@ func TestSignEncryptedWrongPasswordRejected(t *testing.T) {
 	if _, err := signer.signBytes(enc.Bytes(), SignParams{}, "wrong"); err == nil {
 		t.Fatal("signing with the wrong password succeeded")
 	}
+}
+
+// trimDERPadding returns the DER SEQUENCE at the start of b, dropping the
+// zero padding after it.
+func trimDERPadding(b []byte) ([]byte, error) {
+	if len(b) < 2 || b[0] != 0x30 {
+		return nil, fmt.Errorf("/Contents does not start with a DER SEQUENCE")
+	}
+	total := 2 + int(b[1])
+	if b[1]&0x80 != 0 {
+		n := int(b[1] & 0x7f)
+		if n == 0 || n > 4 || len(b) < 2+n {
+			return nil, fmt.Errorf("unsupported DER length encoding")
+		}
+		l := 0
+		for _, c := range b[2 : 2+n] {
+			l = l<<8 | int(c)
+		}
+		total = 2 + n + l
+	}
+	if total > len(b) {
+		return nil, fmt.Errorf("DER length %d exceeds /Contents (%d bytes)", total, len(b))
+	}
+	return b[:total], nil
 }

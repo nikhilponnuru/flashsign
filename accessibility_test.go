@@ -68,6 +68,12 @@ type testPDFOpts struct {
 	// structTreeNull writes /StructTreeRoot null (a stripped structure tree),
 	// which must NOT count as tagged.
 	structTreeNull bool
+	// structTreeRoot, when non-empty, replaces the empty struct tree root
+	// (object 7); extraObjs are appended as objects 11, 12, ...
+	structTreeRoot string
+	extraObjs      []string
+	// noLang leaves /Lang out of a tagged catalog.
+	noLang bool
 }
 
 // Object layout of the generated fixture:
@@ -81,7 +87,10 @@ func buildTestPDF(t *testing.T, opts testPDFOpts) []byte {
 
 	catalog := "<< /Type /Catalog /Pages 2 0 R /Metadata 8 0 R"
 	if opts.tagged || opts.markedOnly {
-		catalog += " /Lang (en-IN) /MarkInfo << /Marked true /Suspects false >>"
+		if !opts.noLang {
+			catalog += " /Lang (en-IN)"
+		}
+		catalog += " /MarkInfo << /Marked true /Suspects false >>"
 		if !opts.markedOnly {
 			catalog += " /StructTreeRoot 7 0 R"
 		}
@@ -115,6 +124,10 @@ func buildTestPDF(t *testing.T, opts testPDFOpts) []byte {
 	if opts.viewerPrefsIndirect != "" {
 		objs[8] = opts.viewerPrefsIndirect
 	}
+	if opts.structTreeRoot != "" {
+		objs[6] = opts.structTreeRoot
+	}
+	objs = append(objs, opts.extraObjs...)
 
 	return assembleTestPDF(objs, "/Info 10 0 R /ID [<0102030405060708090A0B0C0D0E0F10> <0102030405060708090A0B0C0D0E0F10>] ")
 }
@@ -252,8 +265,9 @@ func TestSignTaggedPDFAddsAccessibilityEntries(t *testing.T) {
 
 	// Widget carries an alternate description for assistive technology.
 	mustContain(t, incr, "/TU (Digital signature)", "signature widget")
-	// No dangling structure-tree reference on the widget (note: the page's own
-	// /StructParents entry must survive, hence the raw check).
+	// This fixture's struct tree root has no /ParentTree, so the widget is not
+	// nested in the tree and gets no (dangling) /StructParent (note: the page's
+	// own /StructParents entry must survive, hence the raw check).
 	mustNotContainRaw(t, incr, "/StructParent ", "signature widget")
 
 	// Trailer still references the original /Info and /ID.

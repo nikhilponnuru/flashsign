@@ -1,10 +1,12 @@
 package flashsign
 
 import (
+	"context"
 	"io"
 
 	"github.com/pdfcpu/pdfcpu/pkg/api"
 	"github.com/pdfcpu/pdfcpu/pkg/pdfcpu/model"
+	"github.com/pdfcpu/pdfcpu/pkg/pdfcpu/types"
 )
 
 // accessiblePermissions allows printing plus text extraction for accessibility
@@ -40,6 +42,30 @@ func encryptPDFStream(rs io.ReadSeeker, w io.Writer, password string, keyLength 
 	if err != nil {
 		return err
 	}
+	if err := decodeObjectStreamObjects(ctx); err != nil {
+		return err
+	}
 
 	return api.WriteContext(ctx, w)
+}
+
+// decodeObjectStreamObjects parses every object read from an object stream.
+// pdfcpu keeps those objects as raw text until something dereferences them,
+// and its writer copies such text out verbatim without following the
+// references inside it, so everything reachable only through them (the whole
+// structure tree of a tagged PDF) would be dropped, and strings in them would
+// be left unencrypted.
+func decodeObjectStreamObjects(ctx *model.Context) error {
+	for _, entry := range ctx.Table {
+		if lazy, ok := entry.Object.(types.LazyObjectStreamObject); ok {
+			o, err := lazy.DecodedObject(context.Background())
+			if err != nil {
+				return err
+			}
+			// As pdfcpu's own dereferencing does.
+			model.ProcessRefCounts(ctx.XRefTable, o)
+			entry.Object = o
+		}
+	}
+	return nil
 }

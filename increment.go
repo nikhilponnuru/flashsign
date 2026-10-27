@@ -38,6 +38,14 @@ func (s *Signer) buildIncrement(buf []byte, pi *pdfInfo, srcSize int64, reason, 
 		fontObjNr = nextObj
 		nextObj++
 	}
+	// Tagged documents: a /Form structure element that nests the widget in the
+	// structure tree (see structtree.go).
+	st := &pi.structEdit
+	formObjNr := 0
+	if st.ok {
+		formObjNr = nextObj
+		nextObj++
+	}
 
 	// Tagged (accessible) documents need /DisplayDocTitle plus /Tabs /S on the
 	// page that receives the signature widget. Match the Java signer by adding
@@ -52,15 +60,17 @@ func (s *Signer) buildIncrement(buf []byte, pi *pdfInfo, srcSize int64, reason, 
 	buf = buf[:0]
 	buf = append(buf, '\n')
 
-	// Track xref entries in a fixed-size array (max 7 objects: sig, widget,
-	// appearance, font, catalog, page, viewer preferences). Rewritten objects
-	// keep the generation they already had; new objects start at generation 0.
+	// Track xref entries in a fixed-size array (max 11 objects: sig, widget,
+	// appearance, font, catalog, page, viewer preferences, and for tagged
+	// documents the /Form element, struct tree root, parent tree and the
+	// /Form's parent element). Rewritten objects keep the generation they
+	// already had; new objects start at generation 0.
 	type xrefEnt struct {
 		objNr  int
 		gen    int
 		offset int64
 	}
-	var xrefEntries [7]xrefEnt
+	var xrefEntries [11]xrefEnt
 	xrefCount := 0
 	baseOffset := srcSize
 
@@ -132,6 +142,13 @@ func (s *Signer) buildIncrement(buf []byte, pi *pdfInfo, srcSize int64, reason, 
 		// Alternate field description for assistive technology (PDF/UA-1 7.18.6.2).
 		buf = append(buf, "/TU "...)
 		buf = appendPDFTextString(buf, signatureFieldDescription, fc, widgetObjNr, 0)
+		buf = append(buf, '\n')
+	}
+	if st.ok {
+		// Resolves the widget to its /Form element through the /ParentTree
+		// (PDF/UA-1 7.18.1).
+		buf = append(buf, "/StructParent "...)
+		buf = appendInt(buf, st.key)
 		buf = append(buf, '\n')
 	}
 	if visible && rect.X1 != rect.X2 && rect.Y1 != rect.Y2 {
@@ -259,6 +276,69 @@ func (s *Signer) buildIncrement(buf []byte, pi *pdfInfo, srcSize int64, reason, 
 	}
 	buf = append(buf, "\n>>\nendobj\n\n"...)
 
+	// === Structure tree: /Form element, root, parent tree, parent element ===
+	if st.ok {
+		parentObjNr, parentGen := st.rootObjNr, st.rootGen
+		if st.parentObjNr > 0 {
+			parentObjNr, parentGen = st.parentObjNr, st.parentGen
+		}
+
+		// The widget annotation is the /Form element's only content.
+		recordOffset(formObjNr, 0)
+		buf = appendObjHeader(buf, formObjNr, 0)
+		buf = append(buf, "\n/Type /StructElem\n/S /Form\n/P "...)
+		buf = appendObjRef(buf, parentObjNr, parentGen)
+		buf = append(buf, "\n/Pg "...)
+		buf = appendObjRef(buf, pi.pageObjNr, pi.pageGen)
+		buf = append(buf, "\n/K << /Type /OBJR /Obj "...)
+		buf = appendObjRef(buf, widgetObjNr, 0)
+		buf = append(buf, " /Pg "...)
+		buf = appendObjRef(buf, pi.pageObjNr, pi.pageGen)
+		buf = append(buf, " >>"...)
+		if st.alt {
+			buf = append(buf, "\n/Alt "...)
+			buf = appendPDFTextString(buf, signatureFieldDescription, fc, formObjNr, 0)
+		}
+		buf = append(buf, "\n>>\nendobj\n\n"...)
+
+		// Struct tree root: register the widget's key in the parent tree and,
+		// without a single top-level element, take the /Form as a kid.
+		recordOffset(st.rootObjNr, st.rootGen)
+		buf = appendObjHeader(buf, st.rootObjNr, st.rootGen)
+		if st.parentObjNr == 0 {
+			buf = appendDictWithoutKeys(buf, st.rootRaw, "ParentTree", "ParentTreeNextKey", "K")
+			buf = appendKWithChild(buf, st.parentK, formObjNr)
+		} else {
+			buf = appendDictWithoutKeys(buf, st.rootRaw, "ParentTree", "ParentTreeNextKey")
+		}
+		buf = append(buf, "\n/ParentTree "...)
+		if st.ptObjNr > 0 {
+			buf = appendObjRef(buf, st.ptObjNr, st.ptGen)
+		} else {
+			buf = append(buf, "<<"...)
+			buf = appendParentTree(buf, st, formObjNr)
+			buf = append(buf, ">>"...)
+		}
+		buf = append(buf, "\n/ParentTreeNextKey "...)
+		buf = appendInt(buf, st.key+1)
+		buf = append(buf, "\n>>\nendobj\n\n"...)
+
+		if st.ptObjNr > 0 {
+			recordOffset(st.ptObjNr, st.ptGen)
+			buf = appendObjHeader(buf, st.ptObjNr, st.ptGen)
+			buf = appendParentTree(buf, st, formObjNr)
+			buf = append(buf, ">>\nendobj\n\n"...)
+		}
+
+		if st.parentObjNr > 0 {
+			recordOffset(st.parentObjNr, st.parentGen)
+			buf = appendObjHeader(buf, st.parentObjNr, st.parentGen)
+			buf = appendDictWithoutKey(buf, st.parentRaw, "K")
+			buf = appendKWithChild(buf, st.parentK, formObjNr)
+			buf = append(buf, "\n>>\nendobj\n\n"...)
+		}
+	}
+
 	// === Cross-reference table ===
 	xrefOffset := baseOffset + int64(len(buf))
 	buf = append(buf, "xref\n"...)
@@ -344,6 +424,31 @@ func appendDictWithoutKey(buf []byte, raw []byte, key string) []byte {
 	buf = append(buf, raw[:entryStart]...)
 	buf = append(buf, raw[valueEnd:]...)
 	return buf
+}
+
+// appendDictWithoutKeys copies raw dict content to buf, removing every listed
+// top-level key entry. Keys are given without their leading slash.
+func appendDictWithoutKeys(buf []byte, raw []byte, keys ...string) []byte {
+	var ranges [4][2]int
+	n := 0
+	for _, key := range keys {
+		if start, end := dictKeyRange(raw, key); start >= 0 {
+			ranges[n] = [2]int{start, end}
+			n++
+		}
+	}
+	// Insertion sort by start; top-level key ranges never overlap.
+	for i := 1; i < n; i++ {
+		for j := i; j > 0 && ranges[j][0] < ranges[j-1][0]; j-- {
+			ranges[j], ranges[j-1] = ranges[j-1], ranges[j]
+		}
+	}
+	prev := 0
+	for _, r := range ranges[:n] {
+		buf = append(buf, raw[prev:r[0]]...)
+		prev = r[1]
+	}
+	return append(buf, raw[prev:]...)
 }
 
 // appendDictWithoutKeys2 copies raw dict content to buf, removing both key entries.

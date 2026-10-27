@@ -33,10 +33,11 @@ type pdfInfo struct {
 	idFirst        []byte // decoded first /ID element, input to key derivation
 
 	// Accessibility (tagged PDF) related state.
-	tagged           bool   // /StructTreeRoot present or /MarkInfo << /Marked true >>
-	viewerPrefsObjNr int    // gen-0 indirect /ViewerPreferences object to rewrite; 0 = inline/absent; -1 = leave untouched
-	viewerPrefsRaw   []byte // raw /ViewerPreferences dict content, or nil when absent
-	pageHasTabs      bool   // target page already has a top-level /Tabs entry
+	tagged           bool           // /StructTreeRoot present or /MarkInfo << /Marked true >>
+	viewerPrefsObjNr int            // gen-0 indirect /ViewerPreferences object to rewrite; 0 = inline/absent; -1 = leave untouched
+	viewerPrefsRaw   []byte         // raw /ViewerPreferences dict content, or nil when absent
+	pageHasTabs      bool           // target page already has a top-level /Tabs entry
+	structEdit       structTreeEdit // nesting of the signature widget in the structure tree; see structtree.go
 }
 
 // xrefEntry represents a cross-reference entry.
@@ -187,6 +188,7 @@ func parsePDFAny(data []byte, targetPage int) (pdfInfo, error) {
 	var vpObjNr int
 	var vpRaw []byte
 	pageHasTabs := false
+	var structEdit structTreeEdit
 	if tagged {
 		vpObjNr, vpRaw = resolveViewerPrefs(data, xref, catalogRaw)
 		if vpObjNr > 0 && (vpObjNr == trailer.rootObjNr || vpObjNr == pageObjNr) {
@@ -199,6 +201,8 @@ func parsePDFAny(data []byte, targetPage int) (pdfInfo, error) {
 			vpObjNr = 0
 		}
 		pageHasTabs = findTopLevelKey(pageRaw, "Tabs") >= 0
+		structEdit = resolveStructTreeEdit(data, xref, catalogRaw, trailer.size, trailer.encryptRaw != nil,
+			trailer.rootObjNr, pageObjNr, vpObjNr)
 	}
 
 	// Sloppy producers understate the trailer /Size; allocating new object
@@ -235,6 +239,7 @@ func parsePDFAny(data []byte, targetPage int) (pdfInfo, error) {
 		viewerPrefsObjNr: vpObjNr,
 		viewerPrefsRaw:   vpRaw,
 		pageHasTabs:      pageHasTabs,
+		structEdit:       structEdit,
 	}, nil
 }
 

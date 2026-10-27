@@ -20,13 +20,9 @@ import "bytes"
 // the increment builder copies the raw dictionaries and only rewrites the keys
 // it must change.
 //
-// Note on /StructParent for the signature widget: PDF/UA-1 7.18.1 wants
-// annotations referenced from the structure tree. That requires appending a
-// /Form structure element, extending /StructTreeRoot /K and the /ParentTree
-// number tree plus /ParentTreeNextKey. Emitting a /StructParent without those
-// edits would create a dangling entry, which is worse than omitting it, so
-// FlashSign only adds the widget's /TU description (PDF/UA-1 7.18.6.2) and
-// leaves the structure tree untouched.
+// The signature widget itself is nested in the structure tree inside a /Form
+// element, with its /TU description (PDF/UA-1 7.18.4, 7.18.6.2); see
+// structtree.go. The appearance stream's text font is left unchanged.
 
 var (
 	kwDisplayDocTitleTrue     = []byte(" /DisplayDocTitle true >>")
